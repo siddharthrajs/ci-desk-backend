@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -54,3 +55,84 @@ class UpstreamResponse(BaseModel):
     last_updated: datetime = Field(
         default_factory=utc_now, description="UTC timestamp when this payload was assembled"
     )
+
+
+# ---------------------------------------------------------------------------
+# Enhanced US production sub-endpoint
+# ---------------------------------------------------------------------------
+
+class MonthlyProductionPoint(BaseModel):
+    date: str = Field(..., description="YYYY-MM-DD (first of month)")
+    us_total: float | None = Field(None, description="US total crude production, MBD")
+    padd3:    float | None = Field(None, description="PADD 3 Gulf Coast, MBD")
+    padd2:    float | None = Field(None, description="PADD 2 Midwest, MBD")
+    gom:      float | None = Field(None, description="Gulf of Mexico offshore, MBD")
+
+
+class WeeklyProductionPoint(BaseModel):
+    date:  str   = Field(..., description="YYYY-MM-DD")
+    value: float = Field(..., description="US total crude production, MBD")
+
+
+class UsProductionResponse(BaseModel):
+    weekly_estimate_mbd: float | None  = Field(None, description="Latest weekly estimate, MBD")
+    weekly_wow_change:   float | None  = Field(None, description="WoW change in MBD")
+    monthly_history: list[MonthlyProductionPoint] = Field(default_factory=list)
+    weekly_history:  list[WeeklyProductionPoint]  = Field(default_factory=list)
+    last_updated: datetime = Field(default_factory=utc_now)
+
+
+# ---------------------------------------------------------------------------
+# DUC wells sub-endpoint
+# ---------------------------------------------------------------------------
+
+class BasinDuc(BaseModel):
+    current:    int | None = None
+    mom_change: int | None = None
+
+
+class DucHistoryPoint(BaseModel):
+    date:        str      = Field(..., description="YYYY-MM-DD (first of month)")
+    total:       int | None = None
+    permian:     int | None = None
+    eagle_ford:  int | None = None
+    bakken:      int | None = None
+    niobrara:    int | None = None
+    appalachia:  int | None = None
+    anadarko:    int | None = None
+    haynesville: int | None = None
+
+
+class DucWellsResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    total_duc:   int | None   = None
+    mom_change:  int | None   = None
+    mom_pct:     float | None = None
+    yoy_change:  int | None   = None
+    yoy_pct:     float | None = None
+    signal: str = Field("NEUTRAL", description="DRAW | BUILD | NEUTRAL")
+    history: list[DucHistoryPoint]       = Field(default_factory=list)
+    basins:  dict[str, BasinDuc]         = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Crude imports sub-endpoint
+# ---------------------------------------------------------------------------
+
+class ImportOrigin(BaseModel):
+    country:    str         = Field(...)
+    volume_mbd: float       = Field(..., description="MBD")
+    share_pct:  float       = Field(..., description="% of total imports")
+    mom_change: float | None = None
+
+
+class ImportHistoryPoint(BaseModel):
+    date:  str   = Field(..., description="YYYY-MM-DD (first of month)")
+    value: float = Field(..., description="Total US imports, MBD")
+
+
+class CrudeImportsResponse(BaseModel):
+    last_updated:      datetime              = Field(default_factory=utc_now)
+    total_imports_mbd: float | None          = None
+    top_origins:       list[ImportOrigin]    = Field(default_factory=list)
+    history_total:     list[ImportHistoryPoint] = Field(default_factory=list)

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Scheduler
     scheduler_timezone: str = "UTC"
 
+    # Lightstreamer
+    ls_user: str = ""
+    ls_token: str = ""
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

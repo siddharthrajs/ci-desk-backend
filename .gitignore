@@ -11,3 +11,5 @@ dist/
 .ruff_cache/
 htmlcov/
 .coverage
+
+lightstreamer/

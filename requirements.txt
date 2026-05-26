@@ -7,3 +7,4 @@ pydantic-settings==2.6.1
 apscheduler==3.10.4
 python-dotenv==1.0.1
 python-json-logger==2.0.7
+lightstreamer-client-lib==2.2.1
