@@ -14,24 +14,52 @@ from app.models.common import utc_now
 # =============================================================================
 
 
-class WPSRRow(BaseModel):
-    """One labelled row in a WPSR table. Numeric cells are None when blank."""
+class WPSRSection(BaseModel):
+    """One logical section inside a WPSR table.
 
-    label: str = Field(..., description="Row label as printed in the WPSR")
-    current: float | None = Field(None, description="Current period value")
-    prior_week: float | None = Field(None, description="Prior week value")
-    difference: float | None = Field(None, description="Current minus prior week")
-    percent_change: float | None = Field(None, description="Percent change vs prior week")
-    year_ago: float | None = Field(None, description="Same period one year ago")
+    Most tables have a single section; table 1 has two ("stocks" and
+    "supply_disposition"). Each row carries the label columns named in
+    ``label_columns`` plus every numeric field named in ``numeric_columns``.
+    """
+
+    name: str = Field(..., description="Internal section identifier (e.g. 'stocks')")
+    title: str = Field(..., description="Human-readable section title")
+    label_columns: list[str] = Field(
+        ...,
+        description="Per-row label fields, in render order. One of ('label',) or ('group', 'label').",
+    )
+    numeric_columns: list[str] = Field(
+        ..., description="Per-row numeric field names, in render order"
+    )
+    column_headers: list[str] = Field(
+        ..., description="Display labels paired one-to-one with numeric_columns"
+    )
+    period_dates: dict[str, str] = Field(
+        ...,
+        description=(
+            "ISO dates pulled from the CSV header, keyed by role: "
+            "'current', 'prior_week', 'year_ago', 'two_years_ago' (where present)."
+        ),
+    )
+    rows: list[dict[str, float | str | None]] = Field(
+        ...,
+        description=(
+            "Parsed rows. Each row contains every key listed in label_columns "
+            "(string values) and every key listed in numeric_columns (float | None)."
+        ),
+    )
 
 
 class WPSRTable(BaseModel):
-    """A single WPSR table (1..9) with its parsed rows and content hash."""
+    """A single WPSR table (1..9) with its sections and content hash."""
 
     table_number: int = Field(..., ge=1, le=9, description="WPSR table number (1..9)")
-    title: str = Field(..., description="Original title row from the source CSV")
-    rows: list[WPSRRow] = Field(..., description="Parsed rows; section headers have null numerics")
-    hash: str = Field(..., description="SHA-256 digest over the parsed rows")
+    title: str = Field(..., description="Human-readable table title")
+    sections: list[WPSRSection] = Field(
+        ...,
+        description="One section per logical sub-table. Table 1 has two; the rest have one.",
+    )
+    hash: str = Field(..., description="SHA-256 digest over the sections payload")
     last_fetched: str = Field(..., description="ISO-8601 UTC timestamp of the fetch")
 
 
