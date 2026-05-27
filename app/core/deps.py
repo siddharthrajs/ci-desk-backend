@@ -15,6 +15,7 @@ from app.core.http_client import get_http_client
 from app.services.bakerhughes import BakerHughesService
 from app.services.cftc import CFTCService
 from app.services.eia import EIAService
+from app.services.finnhub import FinnhubService
 from app.services.fred import FREDService
 from app.services.wpsr import WPSRService
 
@@ -39,3 +40,7 @@ def get_baker_hughes_service(
     fred: FREDService = Depends(get_fred_service),
 ) -> BakerHughesService:
     return BakerHughesService(fred)
+
+
+def get_finnhub_service() -> FinnhubService:
+    return FinnhubService(get_http_client(), settings.finnhub_api_key)

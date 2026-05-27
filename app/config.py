@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # External APIs
     eia_api_key: str = ""
     fred_api_key: str = ""
+    finnhub_api_key: str = ""
 
     # Scheduler
     scheduler_timezone: str = "UTC"
