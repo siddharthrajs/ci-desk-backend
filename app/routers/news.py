@@ -1,15 +1,18 @@
-"""News tab — market news, company news, oil quotes, economic calendar (Finnhub)."""
+"""News tab — market news, company news, oil quotes, economic calendar (Finnhub), AI summary."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.core.deps import get_finnhub_service
+from app.core.deps import get_ai_summary_service, get_financial_juice_service, get_finnhub_service
 from app.core.upstream import call_upstream
 from app.models.news import (
+    AiSummaryRequest,
+    AiSummaryResponse,
     CompanyNewsResponse,
     EconomicCalendarResponse,
     EconomicEvent,
@@ -18,7 +21,11 @@ from app.models.news import (
     OilQuotesResponse,
     QuoteData,
 )
+from app.services.ai_summary import DEFAULT_PROMPT, AiSummaryService
+from app.services.financial_juice import FinancialJuiceService
 from app.services.finnhub import OIL_TICKERS, FinnhubService
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/news", tags=["news"])
 
@@ -114,3 +121,31 @@ async def get_economic_calendar(
         to_date=_to,
         events=[EconomicEvent(**e) for e in events_raw],
     )
+
+
+@router.post(
+    "/ai-summary",
+    response_model=AiSummaryResponse,
+    summary="AI-generated crude oil macro summary from Financial Juice news",
+    responses={502: {"description": "Financial Juice feed or AI provider unavailable"}},
+)
+async def get_ai_summary(
+    body: AiSummaryRequest,
+    fj: FinancialJuiceService = Depends(get_financial_juice_service),
+    ai: AiSummaryService = Depends(get_ai_summary_service),
+) -> AiSummaryResponse:
+    news_items = await call_upstream("FinancialJuice", fj.get_recent_news)
+
+    try:
+        summary = await ai.summarize(
+            news_items,
+            prompt=body.prompt if body.prompt is not None else DEFAULT_PROMPT,
+        )
+    except Exception as exc:
+        _logger.warning("Gemini summarize failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI provider unavailable",
+        ) from exc
+
+    return AiSummaryResponse(summary=summary, item_count=len(news_items))

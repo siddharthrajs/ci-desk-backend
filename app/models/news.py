@@ -74,3 +74,13 @@ class EconomicCalendarResponse(BaseModel):
     to_date: str = Field(..., description="End of the queried date range (YYYY-MM-DD)")
     events: list[EconomicEvent] = Field(default_factory=list)
     last_updated: datetime = Field(default_factory=utc_now)
+
+
+class AiSummaryRequest(BaseModel):
+    prompt: str | None = Field(None, description="Custom prompt; uses default crude oil analyst prompt if omitted")
+
+
+class AiSummaryResponse(BaseModel):
+    summary: str = Field(..., description="AI-generated macro summary text")
+    item_count: int = Field(..., description="Number of Financial Juice news items analyzed")
+    generated_at: datetime = Field(default_factory=utc_now)
