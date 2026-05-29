@@ -10,11 +10,14 @@ from typing import Any
 
 import httpx
 
+from app.core.cache import get_cache
+
 logger = logging.getLogger(__name__)
 
 RSS_URL = "https://www.financialjuice.com/rss"
 
 _24H = timedelta(hours=24)
+_RSS_TTL = 300  # 5 minutes
 
 
 class FinancialJuiceService:
@@ -23,13 +26,19 @@ class FinancialJuiceService:
 
     async def get_recent_news(self) -> list[dict[str, Any]]:
         """Fetch the RSS feed and return items published in the last 24 hours."""
-        response = await self._client.get(RSS_URL, timeout=15.0)
-        response.raise_for_status()
-        return self._parse_rss(response.text)
+        async def _fetch() -> list[dict[str, Any]]:
+            response = await self._client.get(RSS_URL, timeout=15.0)
+            response.raise_for_status()
+            return self._parse_rss(response.text)
+
+        return await get_cache().cache_or_fetch("financialjuice:recent_news", _fetch, ttl=_RSS_TTL)
 
     @staticmethod
     def _parse_rss(xml_text: str) -> list[dict[str, Any]]:
-        root = ET.fromstring(xml_text)
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise ValueError(f"Financial Juice RSS feed returned unparseable XML: {exc}") from exc
         channel = root.find("channel")
         if channel is None:
             return []
