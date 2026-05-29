@@ -78,6 +78,7 @@ class EconomicCalendarResponse(BaseModel):
 
 class AiSummaryRequest(BaseModel):
     prompt: str | None = Field(None, description="Custom prompt; uses default crude oil analyst prompt if omitted")
+    provider: str = Field("gemini", description="AI provider: gemini | openai")
 
 
 class AiSummaryResponse(BaseModel):

@@ -53,4 +53,4 @@ def get_financial_juice_service() -> FinancialJuiceService:
 
 
 def get_ai_summary_service() -> AiSummaryService:
-    return AiSummaryService(settings.gemini_api_key)
+    return AiSummaryService(settings.gemini_api_key, settings.openai_api_key)

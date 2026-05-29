@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.deps import get_ai_summary_service, get_financial_juice_service, get_finnhub_service
 from app.core.upstream import call_upstream
@@ -140,6 +140,7 @@ async def get_ai_summary(
         summary = await ai.summarize(
             news_items,
             prompt=body.prompt if body.prompt is not None else DEFAULT_PROMPT,
+            provider=body.provider,
         )
     except Exception as exc:
         _logger.warning("Gemini summarize failed: %s", exc)

@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     finnhub_api_key: str = ""
     gemini_api_key: str = ""
+    openai_api_key: str = ""
 
     # Scheduler
     scheduler_timezone: str = "UTC"
