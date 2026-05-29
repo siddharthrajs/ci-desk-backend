@@ -1,176 +1,215 @@
-"""Upstream tab — crude production, rig activity, OPEC supply placeholder."""
+"""Upstream tab — US subtab.
+
+One endpoint per dashboard panel. The frontend composes the hero strip from
+the latest values returned by /upstream/us/crude-production (cards 1, 3, 4)
+and /upstream/us/rig-count (card 2). OPEC+ subtab is a separate router added
+later.
+"""
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
 from fastapi import APIRouter, Depends
 
-from app.core.deps import get_baker_hughes_service, get_eia_service
+from app.core.deps import get_eia_service
 from app.core.upstream import call_upstream
-from app.models.common import SeriesPoint
 from app.models.upstream import (
-    BasinDuc,
+    ApiGravityResponse,
     CrudeImportsResponse,
-    DucHistoryPoint,
-    DucWellsResponse,
-    ImportHistoryPoint,
-    ImportOrigin,
-    MonthlyProductionPoint,
-    OPECProduction,
-    RigCount,
-    UpstreamResponse,
-    UsProductionResponse,
-    WeeklyProductionPoint,
+    CrudeProductionResponse,
+    ImportCountry,
+    ImportsFeed,
+    ImportsHistoryPoint,
+    NaturalGasResponse,
+    OpecHistoryResponse,
+    OpecHero,
+    OpecMemberRow,
+    OpecProductionResponse,
+    OpecSparkPoint,
+    ProductionByRegionResponse,
+    RegionLatest,
+    ReservesResponse,
+    RigCountResponse,
 )
-from app.services.bakerhughes import BakerHughesService
 from app.services.eia import EIAService
 
 router = APIRouter(prefix="/upstream", tags=["upstream"])
 
 
-@router.get(
-    "",
-    response_model=UpstreamResponse,
-    summary="Upstream production and rig activity",
-    responses={502: {"description": "Upstream data source unavailable"}},
-)
-async def get_upstream(
-    eia: EIAService = Depends(get_eia_service),
-    baker_hughes: BakerHughesService = Depends(get_baker_hughes_service),
-) -> UpstreamResponse:
-    production, rigs = await asyncio.gather(
-        call_upstream("EIA", eia.get_crude_production),
-        baker_hughes.get_rig_count(),
-    )
-
-    return UpstreamResponse(
-        crude_production=[SeriesPoint(**row) for row in production],
-        rig_count=RigCount(**rigs),
-        opec=OPECProduction(),
-    )
-
+# ---------------------------------------------------------------------------
+# /upstream/us/crude-production
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/us-production",
-    response_model=UsProductionResponse,
-    summary="US crude production — weekly estimate + monthly PADD/region breakdown",
+    "/us/crude-production",
+    response_model=CrudeProductionResponse,
+    summary="US weekly + L48 crude production, net imports, monthly history",
     responses={502: {"description": "EIA unavailable"}},
 )
-async def get_us_production(
+async def get_us_crude_production(
     eia: EIAService = Depends(get_eia_service),
-) -> UsProductionResponse:
-    async def fetch_all() -> tuple[Any, Any]:
-        return await asyncio.gather(
-            eia.get_crude_production(),
-            eia.get_us_production_monthly(),
-        )
+) -> CrudeProductionResponse:
+    data = await call_upstream("EIA", eia.get_us_crude_production)
+    return CrudeProductionResponse.model_validate(data)
 
-    weekly_data, monthly_data = await call_upstream("EIA", fetch_all)
 
-    latest = weekly_data[0] if weekly_data else None
+# ---------------------------------------------------------------------------
+# /upstream/us/rig-count
+# ---------------------------------------------------------------------------
 
-    weekly_history = [
-        WeeklyProductionPoint(date=p["period"], value=round(p["value"] / 1000, 3))
-        for p in weekly_data
-    ]
-    monthly_history = [
-        MonthlyProductionPoint(**pt)
-        for pt in monthly_data.get("monthly_history", [])
-    ]
+@router.get(
+    "/us/rig-count",
+    response_model=RigCountResponse,
+    summary="Monthly EIA rotary rig count — total, oil, gas, onshore, offshore",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_us_rig_count(
+    eia: EIAService = Depends(get_eia_service),
+) -> RigCountResponse:
+    data = await call_upstream("EIA", eia.get_us_rig_count)
+    return RigCountResponse.model_validate(data)
 
-    return UsProductionResponse(
-        weekly_estimate_mbd=round(latest["value"] / 1000, 3)           if latest                         else None,
-        weekly_wow_change=  round(latest["wow_change"] / 1000, 3)      if latest and latest.get("wow_change") is not None else None,
-        monthly_history=monthly_history,
-        weekly_history=weekly_history,
+
+# ---------------------------------------------------------------------------
+# /upstream/us/production-by-region
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/us/production-by-region",
+    response_model=ProductionByRegionResponse,
+    summary="Monthly crude production by state/PADD — TX, ND, NM, PADD 2/3, GoA",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_us_production_by_region(
+    eia: EIAService = Depends(get_eia_service),
+) -> ProductionByRegionResponse:
+    data = await call_upstream("EIA", eia.get_us_production_by_region)
+    return ProductionByRegionResponse(
+        regions={k: RegionLatest(**v) for k, v in data.get("regions", {}).items()},
+        history=data.get("history", []),
     )
 
 
+# ---------------------------------------------------------------------------
+# /upstream/us/api-gravity
+# ---------------------------------------------------------------------------
+
 @router.get(
-    "/debug/duc-discovery",
-    summary="[DEBUG] Broad EIA API probe to find DUC / DPR data",
-    include_in_schema=False,
+    "/us/api-gravity",
+    response_model=ApiGravityResponse,
+    summary="Lower-48 crude production by API gravity bucket (monthly)",
+    responses={502: {"description": "EIA unavailable"}},
 )
-async def debug_duc_discovery(
+async def get_us_api_gravity(
     eia: EIAService = Depends(get_eia_service),
-) -> dict[str, Any]:
-    """Phase-2 broad probe — call after learning petroleum/crd has no duc/dprd routes."""
-    results: dict[str, Any] = {}
+) -> ApiGravityResponse:
+    data = await call_upstream("EIA", eia.get_us_api_gravity)
+    return ApiGravityResponse.model_validate(data)
 
-    # Probe EIA root + petroleum + sibling sections that might host DPR
-    meta_paths = [
-        "",                        # root — lists all top-level sections
-        "petroleum",               # petroleum root — lists all sub-sections
-        "petroleum/crd/drill",     # drilling activity (Baker Hughes rig counts)
-        "petroleum/crd/wellend",   # exploratory & development wells drilled
-        "petroleum/sum",           # petroleum supply summary
-        "petroleum/sum/snd",       # supply/summary (non-weekly variant)
-    ]
 
-    for path in meta_paths:
-        url = f"{eia.BASE_URL}/{path}" if path else eia.BASE_URL
-        try:
-            resp = await eia._client.get(url, params={"api_key": eia._api_key})
-            body = resp.json() if resp.status_code == 200 else resp.text[:600]
-            results[f"meta:{path or 'root'}"] = {"status": resp.status_code, "body": body}
-        except Exception as exc:
-            results[f"meta:{path or 'root'}"] = {"error": str(exc)}
-
-    # Raw data sample from drill + wellend — see what fields/facets exist
-    for route in ["petroleum/crd/drill", "petroleum/crd/wellend"]:
-        try:
-            rows = await eia._fetch_eia_series(route, {}, frequency="monthly", length=3)
-            results[f"data:{route}"] = rows
-        except Exception as exc:
-            results[f"data:{route}"] = {"error": str(exc)}
-
-    return results
-
+# ---------------------------------------------------------------------------
+# /upstream/us/crude-imports
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/duc-wells",
-    response_model=DucWellsResponse,
-    summary="DUC (Drilled but Uncompleted) wells by basin — EIA DPR monthly",
-)
-async def get_duc_wells(
-    eia: EIAService = Depends(get_eia_service),
-) -> DucWellsResponse:
-    try:
-        data = await call_upstream("EIA", eia.get_duc_wells)
-    except Exception:
-        # Return empty-but-valid payload so the panel renders gracefully
-        return DucWellsResponse()
-
-    history = [DucHistoryPoint(**pt) for pt in data.get("history", [])]
-    basins  = {k: BasinDuc(**v) for k, v in data.get("basins", {}).items()}
-
-    return DucWellsResponse(
-        total_duc=  data.get("total_duc"),
-        mom_change= data.get("mom_change"),
-        mom_pct=    data.get("mom_pct"),
-        yoy_change= data.get("yoy_change"),
-        yoy_pct=    data.get("yoy_pct"),
-        signal=     data.get("signal", "NEUTRAL"),
-        history=    history,
-        basins=     basins,
-    )
-
-
-@router.get(
-    "/crude-imports",
+    "/us/crude-imports",
     response_model=CrudeImportsResponse,
-    summary="US crude oil imports by country of origin — EIA monthly, top 10",
+    summary="US crude imports by country — weekly preliminary + monthly final",
     responses={502: {"description": "EIA unavailable"}},
 )
-async def get_crude_imports(
+async def get_us_crude_imports(
     eia: EIAService = Depends(get_eia_service),
 ) -> CrudeImportsResponse:
-    data = await call_upstream("EIA", eia.get_crude_imports)
-
+    data = await call_upstream("EIA", eia.get_us_crude_imports)
     return CrudeImportsResponse(
-        total_imports_mbd=data.get("total_imports_mbd"),
-        top_origins=[ImportOrigin(**o) for o in data.get("top_origins", [])],
-        history_total=[ImportHistoryPoint(**pt) for pt in data.get("history_total", [])],
+        weekly_preliminary=ImportsFeed(
+            total_mbd   = data["weekly_preliminary"].get("total_mbd"),
+            top_origins = [ImportCountry(**o) for o in data["weekly_preliminary"].get("top_origins", [])],
+            history     = [ImportsHistoryPoint(**h) for h in data["weekly_preliminary"].get("history", [])],
+        ),
+        monthly_final=ImportsFeed(
+            total_mbd   = data["monthly_final"].get("total_mbd"),
+            top_origins = [ImportCountry(**o) for o in data["monthly_final"].get("top_origins", [])],
+            history     = [ImportsHistoryPoint(**h) for h in data["monthly_final"].get("history", [])],
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/natural-gas
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/us/natural-gas",
+    response_model=NaturalGasResponse,
+    summary="US natural gas production — gross withdrawals + dry, monthly 5Y",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_us_natural_gas(
+    eia: EIAService = Depends(get_eia_service),
+) -> NaturalGasResponse:
+    data = await call_upstream("EIA", eia.get_us_natural_gas)
+    return NaturalGasResponse.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/reserves
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/us/reserves",
+    response_model=ReservesResponse,
+    summary="US proved reserves — crude (BBbl) and dry natural gas (Tcf), annual",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_us_reserves(
+    eia: EIAService = Depends(get_eia_service),
+) -> ReservesResponse:
+    data = await call_upstream("EIA", eia.get_us_reserves)
+    return ReservesResponse.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/production
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/production",
+    response_model=OpecProductionResponse,
+    summary="OPEC+ crude production — hero KPIs, country table, 36M sparklines (monthly)",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_production(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecProductionResponse:
+    data = await call_upstream("EIA", eia.get_opec_production)
+    return OpecProductionResponse(
+        hero=OpecHero(**data.get("hero", {})),
+        table=[OpecMemberRow(**row) for row in data.get("table", [])],
+        sparklines={
+            iso3: [OpecSparkPoint(**pt) for pt in pts]
+            for iso3, pts in data.get("sparklines", {}).items()
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/history
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/history",
+    response_model=OpecHistoryResponse,
+    summary="OPEC+ crude production history — all members, 10Y monthly for stacked area",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_history(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecHistoryResponse:
+    data = await call_upstream("EIA", eia.get_opec_history)
+    return OpecHistoryResponse(
+        members={
+            iso3: [OpecSparkPoint(**pt) for pt in pts]
+            for iso3, pts in data.get("members", {}).items()
+        },
+        periods_available=data.get("periods_available", 0),
     )

@@ -8,7 +8,6 @@ import httpx
 import pytest
 
 from app.services.eia import (
-    CRUDE_PRODUCTION,
     CRUDE_STOCKS,
     CUSHING_STOCKS,
     DISTILLATE_STOCKS,
@@ -21,7 +20,6 @@ from app.services.eia import (
     SPOT_PRICES,
     SPOT_PRODUCTS,
     EIAService,
-    _ROUTE_PRODUCTION,
     _ROUTE_REFINERY,
     _ROUTE_SPOT_PRICES,
     _ROUTE_STOCKS,
@@ -46,10 +44,28 @@ def _eia_response(data: list[dict[str, Any]], status: int = 200) -> httpx.Respon
 
 
 def _make_service() -> tuple[EIAService, AsyncMock]:
-    """Return (service, mock_get) with an AsyncMock httpx client."""
+    """Return (service, mock_get).
+
+    The service used to call `self._client.get(url, params=...)` directly, so
+    the second tuple element was the client's `.get` mock. As of the retry
+    refactor it calls `request_with_retry("GET", url, params=...)` from
+    `app.core.http_client`. To keep these tests unchanged, we monkey-patch the
+    module-level `request_with_retry` reference with a shim that drops the
+    leading method arg and forwards everything else to `mock_get` — so
+    `mock_get.call_args.args[0]` is still the URL and `mock_get.return_value`
+    still controls the HTTP response.
+    """
+    import app.services.eia as eia_mod
+    mock_get = AsyncMock()
+
+    async def _shim(_method: str, url: str, **kwargs: Any) -> Any:
+        return await mock_get(url, **kwargs)
+
+    eia_mod.request_with_retry = _shim  # type: ignore[assignment]
+
     mock_client = AsyncMock(spec=httpx.AsyncClient)
     service = EIAService(client=mock_client, api_key="test_key")
-    return service, mock_client.get
+    return service, mock_get
 
 
 def _stock_row(period: str, value: str, product: str = "EPC0", area: str = "NUS") -> dict:
@@ -315,38 +331,6 @@ class TestGetSprLevel:
         mock_get.return_value = _eia_response([_stock_row("2024-01-12", "350000")])
         await service.get_spr_level()
         assert no_cache.cache_or_fetch.call_args.args[0] == "eia:spr_level"
-
-
-class TestGetCrudeProduction:
-    @pytest.mark.asyncio
-    async def test_returns_parsed_data(self, no_cache: MagicMock) -> None:
-        service, mock_get = _make_service()
-        mock_get.return_value = _eia_response([
-            {"period": "2024-01-12", "area": "NUS", "process": "FPF", "value": "13200"},
-            {"period": "2024-01-05", "area": "NUS", "process": "FPF", "value": "13100"},
-        ])
-        result = await service.get_crude_production()
-        assert result[0]["value"] == 13200.0
-        assert result[0]["wow_change"] == 100.0
-
-    @pytest.mark.asyncio
-    async def test_hits_production_route(self, no_cache: MagicMock) -> None:
-        service, mock_get = _make_service()
-        mock_get.return_value = _eia_response([
-            {"period": "2024-01-12", "area": "NUS", "process": "FPF", "value": "13200"},
-        ])
-        await service.get_crude_production()
-        url = mock_get.call_args.args[0]
-        assert _ROUTE_PRODUCTION in url
-
-    @pytest.mark.asyncio
-    async def test_cache_key(self, no_cache: MagicMock) -> None:
-        service, mock_get = _make_service()
-        mock_get.return_value = _eia_response([
-            {"period": "2024-01-12", "area": "NUS", "process": "FPF", "value": "13200"},
-        ])
-        await service.get_crude_production()
-        assert no_cache.cache_or_fetch.call_args.args[0] == "eia:crude_production"
 
 
 class TestGetRefineryUtilization:

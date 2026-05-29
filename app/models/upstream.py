@@ -1,138 +1,239 @@
-"""Response models for the Upstream dashboard tab."""
+"""Response models for the Upstream → US subtab.
+
+Each model maps 1:1 to one endpoint in routers/upstream.py. Volumes are in
+MBD (million barrels per day) for liquids and Bcf/d (billion cubic feet per
+day) for natural gas, unless a field name says otherwise.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.models.common import SeriesPoint, utc_now
-
-
-class RigCount(BaseModel):
-    """Baker Hughes weekly rig count (sourced from FRED proxy RIGTNXUS).
-
-    The oil/gas breakdown is always None — see README.md.
-    """
-
-    available: bool = Field(..., description="False if all upstream rig-count sources failed")
-    source: str = Field(..., description="Identifier of the underlying data source")
-    report_date: str | None = Field(None, description="ISO date of the most recent rig count")
-    total: int | None = Field(None, description="Total U.S. rotary rig count")
-    oil: int | None = Field(None, description="Oil rig count (None — see README)")
-    gas: int | None = Field(None, description="Gas rig count (None — see README)")
-    wow_change: float | None = Field(None, description="Week-over-week change in total rigs")
-    reason: str | None = Field(None, description="Failure reason when available=False")
-
-
-class OPECProduction(BaseModel):
-    """OPEC monthly production placeholder.
-
-    No free, redistribution-friendly OPEC MOMR feed exists — see README.md. The
-    payload is shaped so the frontend can render an "unavailable" state today
-    and switch to live data the moment a paid provider is wired in.
-    """
-
-    available: bool = Field(False, description="Always False until a paid provider is wired in")
-    source: str = Field("placeholder", description="Identifier of the underlying data source")
-    reason: str = Field(
-        "OPEC MOMR production data requires a paid data provider (see README)",
-        description="Human-readable explanation",
-    )
-    report_date: str | None = Field(None, description="ISO date of the most recent value")
-    total_kbpd: float | None = Field(None, description="OPEC total production, thousand bbl/day")
-
-
-class UpstreamResponse(BaseModel):
-    """Upstream tab payload: production, rig activity, OPEC supply."""
-
-    crude_production: list[SeriesPoint] = Field(
-        ..., description="Weekly U.S. crude oil field production (kbpd), newest-first"
-    )
-    rig_count: RigCount = Field(..., description="Latest Baker Hughes rig count")
-    opec: OPECProduction = Field(..., description="OPEC production placeholder")
-    last_updated: datetime = Field(
-        default_factory=utc_now, description="UTC timestamp when this payload was assembled"
-    )
+from app.models.common import utc_now
 
 
 # ---------------------------------------------------------------------------
-# Enhanced US production sub-endpoint
+# /upstream/us/crude-production
+# Weekly US + L48 + Net Imports + Monthly US (history for hero strip + chart)
 # ---------------------------------------------------------------------------
 
-class MonthlyProductionPoint(BaseModel):
-    date: str = Field(..., description="YYYY-MM-DD (first of month)")
-    us_total: float | None = Field(None, description="US total crude production, MBD")
-    padd3:    float | None = Field(None, description="PADD 3 Gulf Coast, MBD")
-    padd2:    float | None = Field(None, description="PADD 2 Midwest, MBD")
-    gom:      float | None = Field(None, description="Gulf of Mexico offshore, MBD")
+class WeeklyPoint(BaseModel):
+    date:  str   = Field(..., description="ISO date (YYYY-MM-DD)")
+    value: float = Field(..., description="MBD")
 
 
-class WeeklyProductionPoint(BaseModel):
-    date:  str   = Field(..., description="YYYY-MM-DD")
-    value: float = Field(..., description="US total crude production, MBD")
+class MonthlyRegionPoint(BaseModel):
+    date:     str          = Field(..., description="YYYY-MM-DD (first of month)")
+    us_total: float | None = None
+    l48:      float | None = None
 
 
-class UsProductionResponse(BaseModel):
-    weekly_estimate_mbd: float | None  = Field(None, description="Latest weekly estimate, MBD")
-    weekly_wow_change:   float | None  = Field(None, description="WoW change in MBD")
-    monthly_history: list[MonthlyProductionPoint] = Field(default_factory=list)
-    weekly_history:  list[WeeklyProductionPoint]  = Field(default_factory=list)
+class CrudeProductionResponse(BaseModel):
     last_updated: datetime = Field(default_factory=utc_now)
 
+    # Hero card 1: weekly US crude production
+    weekly_us_mbd:      float | None = None
+    weekly_us_wow:      float | None = None
+    weekly_us_yoy:      float | None = None
+
+    # Hero card 3: weekly L48 crude production
+    weekly_l48_mbd:     float | None = None
+    weekly_l48_wow:     float | None = None
+
+    # Hero card 4: weekly net imports (crude)
+    weekly_net_imports_mbd: float | None = None
+    weekly_net_imports_wow: float | None = None
+
+    # Primary chart: weekly history (5Y), monthly history (3Y)
+    weekly_history:  list[WeeklyPoint]        = Field(default_factory=list)
+    monthly_history: list[MonthlyRegionPoint] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
-# DUC wells sub-endpoint
+# /upstream/us/rig-count  (EIA-republished Baker Hughes, monthly)
 # ---------------------------------------------------------------------------
 
-class BasinDuc(BaseModel):
-    current:    int | None = None
-    mom_change: int | None = None
+class RigSeriesPoint(BaseModel):
+    date:     str = Field(..., description="YYYY-MM-DD (first of month)")
+    total:    int | None = None
+    oil:      int | None = None
+    gas:      int | None = None
+    onshore:  int | None = None
+    offshore: int | None = None
 
 
-class DucHistoryPoint(BaseModel):
-    date:        str      = Field(..., description="YYYY-MM-DD (first of month)")
-    total:       int | None = None
-    permian:     int | None = None
-    eagle_ford:  int | None = None
-    bakken:      int | None = None
-    niobrara:    int | None = None
-    appalachia:  int | None = None
-    anadarko:    int | None = None
-    haynesville: int | None = None
-
-
-class DucWellsResponse(BaseModel):
+class RigCountResponse(BaseModel):
     last_updated: datetime = Field(default_factory=utc_now)
-    total_duc:   int | None   = None
-    mom_change:  int | None   = None
-    mom_pct:     float | None = None
-    yoy_change:  int | None   = None
-    yoy_pct:     float | None = None
-    signal: str = Field("NEUTRAL", description="DRAW | BUILD | NEUTRAL")
-    history: list[DucHistoryPoint]       = Field(default_factory=list)
-    basins:  dict[str, BasinDuc]         = Field(default_factory=dict)
+    # Hero card 2 — latest values + change vs prior reporting period
+    latest_total:    int | None = None
+    latest_oil:      int | None = None
+    latest_gas:      int | None = None
+    mom_change:      int | None = None
+    yoy_change:      int | None = None
+    history: list[RigSeriesPoint] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# Crude imports sub-endpoint
+# /upstream/us/production-by-region  (monthly, small-multiples)
 # ---------------------------------------------------------------------------
 
-class ImportOrigin(BaseModel):
-    country:    str         = Field(...)
-    volume_mbd: float       = Field(..., description="MBD")
-    share_pct:  float       = Field(..., description="% of total imports")
+class RegionLatest(BaseModel):
+    current:    float | None = Field(None, description="Latest monthly value, MBD")
     mom_change: float | None = None
+    yoy_change: float | None = None
 
 
-class ImportHistoryPoint(BaseModel):
-    date:  str   = Field(..., description="YYYY-MM-DD (first of month)")
-    value: float = Field(..., description="Total US imports, MBD")
+class RegionHistoryPoint(BaseModel):
+    date:            str = Field(..., description="YYYY-MM-DD")
+    texas:           float | None = None
+    north_dakota:    float | None = None
+    new_mexico:      float | None = None
+    padd2:           float | None = None
+    padd3:           float | None = None
+    gulf_of_america: float | None = None
+
+
+class ProductionByRegionResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    regions: dict[str, RegionLatest] = Field(default_factory=dict)
+    history: list[RegionHistoryPoint] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/api-gravity  (Lower-48 monthly, gravity-bucket share)
+# ---------------------------------------------------------------------------
+
+class GravityPoint(BaseModel):
+    date:       str          = Field(..., description="YYYY-MM-DD")
+    heavy:      float | None = Field(None, description="≤30 API, MBD")
+    medium:     float | None = Field(None, description="30.1–40 API, MBD")
+    light:      float | None = Field(None, description="40.1–50 API, MBD")
+    condensate: float | None = Field(None, description="50.1+ API, MBD")
+
+
+class ApiGravityResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    # Latest snapshot — % share by bucket
+    latest_heavy_pct:      float | None = None
+    latest_medium_pct:     float | None = None
+    latest_light_pct:      float | None = None
+    latest_condensate_pct: float | None = None
+    history: list[GravityPoint] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/crude-imports  (weekly preliminary + monthly final)
+# ---------------------------------------------------------------------------
+
+class ImportCountry(BaseModel):
+    country:    str          = Field(..., description="ISO-3 or descriptive country name")
+    volume_mbd: float
+    share_pct:  float
+    mom_change: float | None = None
+    is_opec_plus: bool = False
+
+
+class ImportsHistoryPoint(BaseModel):
+    date:  str   = Field(..., description="YYYY-MM-DD")
+    value: float = Field(..., description="Total US crude imports, MBD")
+
+
+class ImportsFeed(BaseModel):
+    """A single feed (weekly preliminary or monthly final). Both feeds share this shape."""
+    total_mbd:    float | None             = None
+    top_origins:  list[ImportCountry]      = Field(default_factory=list)
+    history:      list[ImportsHistoryPoint] = Field(default_factory=list)
 
 
 class CrudeImportsResponse(BaseModel):
-    last_updated:      datetime              = Field(default_factory=utc_now)
-    total_imports_mbd: float | None          = None
-    top_origins:       list[ImportOrigin]    = Field(default_factory=list)
-    history_total:     list[ImportHistoryPoint] = Field(default_factory=list)
+    last_updated: datetime = Field(default_factory=utc_now)
+    weekly_preliminary: ImportsFeed = Field(default_factory=ImportsFeed)
+    monthly_final:      ImportsFeed = Field(default_factory=ImportsFeed)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/natural-gas  (monthly, gross withdrawals + dry + shale)
+# ---------------------------------------------------------------------------
+
+class NaturalGasPoint(BaseModel):
+    date:               str          = Field(..., description="YYYY-MM-DD")
+    gross_withdrawals:  float | None = Field(None, description="Bcf/d")
+    dry_production:     float | None = Field(None, description="Bcf/d")
+
+
+class NaturalGasResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    latest_gross_withdrawals: float | None = None
+    latest_dry_production:    float | None = None
+    yoy_change_pct:           float | None = None
+    history: list[NaturalGasPoint] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/us/reserves  (annual proved reserves — footer tiles)
+# ---------------------------------------------------------------------------
+
+class ReservesPoint(BaseModel):
+    year:  str
+    value: float | None = None
+
+
+class ReservesResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    crude_latest_year:    str | None   = None
+    crude_proved_bbbl:    float | None = Field(None, description="Billion barrels")
+    ng_latest_year:       str | None   = None
+    ng_proved_tcf:        float | None = Field(None, description="Trillion cubic feet")
+    crude_history: list[ReservesPoint] = Field(default_factory=list)
+    ng_history:    list[ReservesPoint] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/production  (monthly — hero KPIs, country table, sparklines)
+# ---------------------------------------------------------------------------
+
+class OpecHero(BaseModel):
+    total_mbd:     float | None = Field(None, description="OPEC+ aggregate crude, MBD")
+    total_mom:     float | None = None
+    latest_period: str | None   = None
+    saudi_mbd:     float | None = None
+    saudi_mom:     float | None = None
+    russia_mbd:    float | None = None
+    russia_mom:    float | None = None
+    iraq_mbd:      float | None = None
+    iraq_mom:      float | None = None
+
+
+class OpecMemberRow(BaseModel):
+    iso3:        str
+    country:     str
+    latest_mbd:  float
+    mom:         float | None = Field(None, description="MoM change, MBD")
+    mom_pct:     float | None = None
+    yoy:         float | None = Field(None, description="YoY change, MBD")
+    yoy_pct:     float | None = None
+    share_pct:   float | None = Field(None, description="% of OPEC+ total")
+
+
+class OpecSparkPoint(BaseModel):
+    period: str   = Field(..., description="YYYY-MM-DD (first of month)")
+    value:  float = Field(..., description="MBD")
+
+
+class OpecProductionResponse(BaseModel):
+    last_updated: datetime = Field(default_factory=utc_now)
+    hero:       OpecHero
+    table:      list[OpecMemberRow]              = Field(default_factory=list)
+    sparklines: dict[str, list[OpecSparkPoint]]  = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/history  (10Y stacked area — all members, monthly)
+# ---------------------------------------------------------------------------
+
+class OpecHistoryResponse(BaseModel):
+    last_updated:      datetime = Field(default_factory=utc_now)
+    members:           dict[str, list[OpecSparkPoint]] = Field(default_factory=dict)
+    periods_available: int = 0

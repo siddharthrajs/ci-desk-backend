@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from app.core.cache import get_cache
+from app.core.http_client import request_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,23 @@ logger = logging.getLogger(__name__)
 # EIA v2 API route paths
 # =============================================================================
 _ROUTE_STOCKS = "petroleum/stoc/wstk"
-_ROUTE_PRODUCTION = "petroleum/sum/sndw"
 _ROUTE_REFINERY = "petroleum/pnp/wiup"
 _ROUTE_PRODUCT_SUPPLIED = "petroleum/cons/wpsup"
 _ROUTE_SPOT_PRICES = "petroleum/pri/spt"
-_ROUTE_MONTHLY_PRODUCTION = "petroleum/crd/crpdn"
-_ROUTE_DUC = "petroleum/crd/duc"
-_ROUTE_CRUDE_IMPORTS = "crude-oil-imports"
+
+# Upstream — US subtab
+_ROUTE_WEEKLY_SUPPLY      = "petroleum/sum/sndw"   # weekly crude prod, net imports
+_ROUTE_MONTHLY_PRODUCTION = "petroleum/crd/crpdn"  # monthly crude by state/PADD
+_ROUTE_DRILL              = "petroleum/crd/drill"  # rotary / well-service rigs
+_ROUTE_API_GRAVITY        = "petroleum/crd/api"    # production by API gravity
+_ROUTE_WEEKLY_IMPORTS_CTY = "petroleum/move/wimpc" # weekly preliminary imports by country
+_ROUTE_CRUDE_IMPORTS      = "crude-oil-imports"    # monthly final imports by country
+_ROUTE_NG_PRODUCTION      = "natural-gas/prod/sum" # NG gross withdrawals + dry
+_ROUTE_CRUDE_RESERVES     = "petroleum/crd/pres"   # crude proved reserves (annual)
+_ROUTE_NG_RESERVES        = "natural-gas/enr/dry"  # dry NG proved reserves (annual)
+
+# Upstream — OPEC+ subtab
+_ROUTE_INTERNATIONAL      = "international"         # country-level production (monthly)
 
 # =============================================================================
 # Series filter constants — EIA v2 facet parameters
@@ -83,18 +94,6 @@ SPR_LEVEL: dict[str, list[str]] = {
     "product":  ["EPCO"],
     "duoarea":  ["NUS"],
     "process":  ["SAX"],
-}
-
-# ---------------------------------------------------------------------------
-# petroleum/sum/sndw — Weekly Petroleum Summary (includes crude production)
-#   duoarea code: NUS=U.S. total
-#   process code: FPF=field production of crude oil
-# ---------------------------------------------------------------------------
-
-# Domestic crude output — primary tracker of shale growth vs. OPEC production cuts.
-CRUDE_PRODUCTION: dict[str, list[str]] = {
-    "duoarea": ["NUS"],
-    "process": ["FPF"],
 }
 
 # ---------------------------------------------------------------------------
@@ -185,48 +184,111 @@ SPOT_SERIES_FULL: dict[str, list[str]] = {
     "series": list(SPOT_SERIES_LABELS.keys()),
 }
 
-# ---------------------------------------------------------------------------
-# petroleum/crd/crpdn — Monthly crude production by PADD/region (Thousand Bbl/Day)
-#   product: EPC0=crude oil including condensates
-#   process: FPF=field production of crude
-#   duoarea: NUS=US total, R30=PADD 3 Gulf Coast, R20=PADD 2 Midwest, GOMS=GOM offshore
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Upstream — US subtab constants
+# =============================================================================
 
-MONTHLY_PROD_AREAS: dict[str, str] = {
-    "NUS":  "us_total",
-    "R30":  "padd3",
+# petroleum/crd/crpdn — region/state breakdown for the small-multiples panel.
+# State codes (Sxx) coexist with PADD codes (Rxx) and the GOMS aggregate.
+US_PRODUCTION_REGIONS: dict[str, str] = {
+    "STX":  "texas",
+    "SND":  "north_dakota",
+    "SNM":  "new_mexico",
     "R20":  "padd2",
-    "GOMS": "gom",
+    "R30":  "padd3",
+    "GOMS": "gulf_of_america",
 }
 
-MONTHLY_PROD_FACETS: dict[str, list[str]] = {
-    "duoarea": list(MONTHLY_PROD_AREAS.keys()),
-    "product": ["EPC0"],
-    "process": ["FPF"],
+# petroleum/crd/drill — rotary + well-service rigs (EIA's republished Baker
+# Hughes data). Filtering by series ID avoids ambiguity from the overlapping
+# (duoarea, product, process) triples.
+US_RIG_SERIES: dict[str, str] = {
+    "E_ERTRR0_XR0_NUS_C":   "total",
+    "E_ERTRRO_XR0_NUS_C":   "oil",
+    "E_ERTRRG_XR0_NUS_C":   "gas",
+    "E_ERTRR0_XR0_RUSON_C": "onshore",
+    "E_ERTRR0_XR0_RUSOF_C": "offshore",
 }
 
-# ---------------------------------------------------------------------------
-# petroleum/crd/duc — DUC (Drilled but Uncompleted) wells by basin, monthly
-#
-# Facet values discovered via GET /v2/petroleum/crd/duc (no /data).
-# Known duoarea codes as of 2024:
-#   NUS=US Total, PERM=Permian, EFRD=Eagle Ford, BKKN=Bakken,
-#   NBRR=DJ Niobrara, APPS=Appalachia, ANK=Anadarko, HSVL=Haynesville
-# ---------------------------------------------------------------------------
-
-DUC_AREAS: dict[str, str] = {
-    "NUS":  "total",
-    "PERM": "permian",
-    "EFRD": "eagle_ford",
-    "BKKN": "bakken",
-    "NBRR": "niobrara",
-    "APPS": "appalachia",
-    "ANK":  "anadarko",
-    "HSVL": "haynesville",
+# petroleum/crd/api — gravity buckets are published at the state level only;
+# Lower-48 totals come from summing these states server-side. R98 = "Other
+# States" aggregate. R3FM = Federal Offshore Gulf (intentionally excluded to
+# avoid double counting once we add GoA elsewhere).
+API_GRAVITY_STATES: list[str] = [
+    "STX", "SND", "SNM", "SOK", "SCA", "SCO", "SWY", "SUT", "SMT",
+    "SOH", "SLA", "SPA", "SAR", "SKS", "SWV", "R98",
+]
+API_GRAVITY_BUCKETS: dict[str, str] = {
+    "EPC30L": "heavy",       # ≤30 API
+    "EPC43B": "medium",      # 30.1–40 API
+    "EPC54B": "light",       # 40.1–50 API
+    "EPC50G": "condensate",  # 50.1+ API
 }
 
-DUC_FACETS: dict[str, list[str]] = {
-    "duoarea": list(DUC_AREAS.keys()),
+# petroleum/move/wimpc — weekly preliminary imports use NUS-Nxx country codes.
+# The response carries the ISO-3 code as `area-name`; we map ISO-3 → OPEC+ flag.
+# OPEC: Algeria, Iran, Iraq, Kuwait, Libya, Nigeria, Saudi Arabia, UAE,
+#       Venezuela, Equatorial Guinea, Gabon, Rep. of Congo. (Angola left 2024.)
+# OPEC+ partners: Russia, Kazakhstan, Azerbaijan, Bahrain, Brunei, Malaysia,
+#                 Mexico, Oman, South Sudan, Sudan.
+OPEC_PLUS_ISO3: set[str] = {
+    "DZA", "IRN", "IRQ", "KWT", "LBY", "NGA", "SAU", "ARE",
+    "VEN", "GNQ", "GAB", "COG",
+    "RUS", "KAZ", "AZE", "BHR", "BRN", "MYS", "MEX", "OMN", "SDN", "SSD",
+}
+
+# crude-oil-imports uses descriptive country names (not ISO-3) in the
+# originName field. Cover the OPEC+ members that actually appear in US
+# import data — countries that haven't shipped to the US for years are
+# omitted to keep the set tight.
+OPEC_PLUS_NAMES: set[str] = {
+    "Algeria", "Iran", "Iraq", "Kuwait", "Libya", "Nigeria",
+    "Saudi Arabia", "United Arab Emirates",
+    "Venezuela", "Equatorial Guinea", "Gabon", "Republic Of Congo (Brazzaville)",
+    "Russia", "Kazakhstan", "Azerbaijan", "Bahrain", "Brunei",
+    "Malaysia", "Mexico", "Oman", "Sudan", "South Sudan",
+}
+
+# natural-gas/prod/sum — process codes for NG production aggregates.
+#   FGW = Gross Withdrawals, FPD = Dry Production, FGS = Shale withdrawals.
+NG_PROCESS_GROSS = "FGW"
+NG_PROCESS_DRY   = "FPD"
+
+# =============================================================================
+# Upstream — OPEC+ subtab constants
+# =============================================================================
+
+# international — EIA v2 facets for crude-oil production by country.
+#   productId=55  = Crude oil + lease condensate (Thousand Barrels per Day)
+#   activityId=1  = Production
+# Verify / explore at: https://www.eia.gov/opendata/browser/international
+_INTL_PRODUCT_ID  = "55"
+_INTL_ACTIVITY_ID = "1"
+
+# OPEC+ member ISO-3 codes → display names, ordered by typical production level.
+# Core OPEC (12 members after Angola's 2024 exit) + non-OPEC+ partners.
+OPEC_PLUS_PROD_MEMBERS: dict[str, str] = {
+    "SAU": "Saudi Arabia",
+    "RUS": "Russia",
+    "IRQ": "Iraq",
+    "ARE": "United Arab Emirates",
+    "KWT": "Kuwait",
+    "IRN": "Iran",
+    "NGA": "Nigeria",
+    "KAZ": "Kazakhstan",
+    "LBY": "Libya",
+    "DZA": "Algeria",
+    "OMN": "Oman",
+    "VEN": "Venezuela",
+    "GAB": "Gabon",
+    "AZE": "Azerbaijan",
+    "COG": "Congo",
+    "GNQ": "Equatorial Guinea",
+    "MYS": "Malaysia",
+    "SDN": "Sudan",
+    "BRN": "Brunei",
+    "SSD": "South Sudan",
+    "BHR": "Bahrain",
 }
 
 # Legacy product-code constants kept for the existing /api/downstream endpoint.
@@ -300,8 +362,16 @@ class EIAService:
         for key, values in facets.items():
             params[f"facets[{key}][]"] = values
 
+        # EIA occasionally takes 20-40s to respond on heavy queries (multi-state
+        # aggregations, 5Y weekly histories). Use the shared retry-equipped
+        # client + extend read timeout to 60s for EIA only — the shared 30s
+        # default is fine for FRED/CFTC but tight for EIA's bigger payloads.
         url = f"{self.BASE_URL}/{route}/data/"
-        response = await self._client.get(url, params=params)
+        response = await request_with_retry(
+            "GET", url,
+            params=params,
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
+        )
         response.raise_for_status()
         return response.json()["response"]["data"]
 
@@ -395,16 +465,8 @@ class EIAService:
         return await get_cache().cache_or_fetch("eia:spr_level", fetch)
 
     # -------------------------------------------------------------------------
-    # Production & refining
+    # Refining (shared across midstream + downstream)
     # -------------------------------------------------------------------------
-
-    async def get_crude_production(self) -> list[dict[str, Any]]:
-        """Weekly U.S. crude oil field production (Thousand Barrels/Day)."""
-        async def fetch() -> list[dict[str, Any]]:
-            rows = await self._fetch_eia_series(_ROUTE_PRODUCTION, CRUDE_PRODUCTION)
-            return self._parse_series(rows)
-
-        return await get_cache().cache_or_fetch("eia:crude_production", fetch)
 
     async def get_refinery_utilization(self) -> dict[str, list[dict[str, Any]]]:
         """Weekly refinery utilization (%) for national + PADD 1-5."""
@@ -488,199 +550,695 @@ class EIAService:
 
         return await get_cache().cache_or_fetch("eia:product_supplied_full_v2", fetch, ttl=3600)
 
-    # -------------------------------------------------------------------------
-    # Upstream sub-endpoints (new)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Upstream — US subtab
+    # =========================================================================
 
-    async def get_us_production_monthly(self) -> dict[str, Any]:
-        """Monthly U.S. crude production by region (MBD) — US total, PADD 2, PADD 3, GOM — 36 months.
+    async def get_us_crude_production(self) -> dict[str, Any]:
+        """Weekly US + L48 crude production, weekly net imports, and 3Y monthly
+        crude production. Single bundle for the primary chart + hero cards 1/3/4.
 
-        length=144 = 4 areas × 36 months.
+        Units: all values returned in MBD (input is kbpd from EIA, /1000).
         """
         async def fetch() -> dict[str, Any]:
-            rows = await self._fetch_eia_series(
-                _ROUTE_MONTHLY_PRODUCTION,
-                MONTHLY_PROD_FACETS,
-                frequency="monthly",
-                length=144,
+            # 5Y of weekly data = ~260 weeks. Request 280 for safety buffer.
+            # Each sub-call is independent; if EIA is having a partial outage
+            # (one route slow, others fine) we degrade gracefully — return what
+            # came back, null the rest — rather than failing the whole panel.
+            us_weekly, l48_weekly, net_imports, monthly_rows_raw = await asyncio.gather(
+                self._fetch_eia_series(
+                    _ROUTE_WEEKLY_SUPPLY,
+                    {"duoarea": ["NUS"], "process": ["FPF"]},
+                    frequency="weekly", length=280,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_WEEKLY_SUPPLY,
+                    {"duoarea": ["R48"], "process": ["FPF"]},
+                    frequency="weekly", length=280,
+                ),
+                self._fetch_eia_series(
+                    # Net-imports series lives on duoarea NUS-Z00 (not NUS).
+                    _ROUTE_WEEKLY_SUPPLY,
+                    {"duoarea": ["NUS-Z00"], "process": ["IMN"], "product": ["EPC0"]},
+                    frequency="weekly", length=280,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_MONTHLY_PRODUCTION,
+                    {"duoarea": ["NUS"], "product": ["EPC0"], "process": ["FPF"]},
+                    frequency="monthly", length=80,
+                ),
+                return_exceptions=True,
             )
+
+            # Treat each Exception as "no data" — log + null out that series.
+            def _safe(result: Any, label: str) -> list[dict[str, Any]]:
+                if isinstance(result, Exception):
+                    logger.warning("eia.us_crude_production: %s failed: %s", label, result)
+                    return []
+                return result  # type: ignore[no-any-return]
+
+            us_weekly    = _safe(us_weekly,         "us_weekly")
+            l48_weekly   = _safe(l48_weekly,        "l48_weekly")
+            net_imports  = _safe(net_imports,       "net_imports")
+            monthly_rows_raw = _safe(monthly_rows_raw, "monthly")
+
+            # crpdn publishes both MBBL (monthly total) and MBBL/D rows — we
+            # only want per-day rates. No L48 aggregate exists at this route,
+            # so monthly history is NUS-only (L48 is available weekly via sndw).
+            monthly_rows = [r for r in monthly_rows_raw if r.get("units") == "MBBL/D"]
+
+            us = self._parse_series(us_weekly)
+            l48 = self._parse_series(l48_weekly)
+            ni = self._parse_series(net_imports)
+
+            def _yoy_pct(rows: list[dict[str, Any]]) -> float | None:
+                """Compare row[0] vs row[~52] (1 year ago)."""
+                if len(rows) < 53 or rows[52]["value"] == 0:
+                    return None
+                return round((rows[0]["value"] - rows[52]["value"]) / rows[52]["value"] * 100, 2)
+
+            us_latest  = us[0]  if us  else None
+            l48_latest = l48[0] if l48 else None
+            ni_latest  = ni[0]  if ni  else None
+
+            weekly_history = [
+                {"date": r["period"], "value": round(r["value"] / 1000, 3)}
+                for r in us
+            ]
+
+            monthly_by_period: dict[str, float] = {}
+            for row in monthly_rows:
+                period = row.get("period", "")
+                if not period or row.get("duoarea") != "NUS":
+                    continue
+                try:
+                    monthly_by_period[period] = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+
+            monthly_history = [
+                {
+                    "date":     f"{p}-01",
+                    "us_total": round(monthly_by_period[p] / 1000, 3),
+                    "l48":      None,  # not published at this route — use weekly_l48 instead
+                }
+                for p in sorted(monthly_by_period.keys(), reverse=True)
+            ]
+
+            return {
+                "weekly_us_mbd":          round(us_latest["value"] / 1000, 3)              if us_latest else None,
+                "weekly_us_wow":          round(us_latest["wow_change"] / 1000, 3)         if us_latest and us_latest.get("wow_change") is not None else None,
+                "weekly_us_yoy":          _yoy_pct(us),
+                "weekly_l48_mbd":         round(l48_latest["value"] / 1000, 3)             if l48_latest else None,
+                "weekly_l48_wow":         round(l48_latest["wow_change"] / 1000, 3)        if l48_latest and l48_latest.get("wow_change") is not None else None,
+                "weekly_net_imports_mbd": round(ni_latest["value"] / 1000, 3)              if ni_latest else None,
+                "weekly_net_imports_wow": round(ni_latest["wow_change"] / 1000, 3)         if ni_latest and ni_latest.get("wow_change") is not None else None,
+                "weekly_history":  weekly_history,
+                "monthly_history": monthly_history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:us_crude_production_v1", fetch, ttl=3600)
+
+    async def get_us_rig_count(self) -> dict[str, Any]:
+        """Monthly EIA-republished rig counts: total, oil, gas, onshore, offshore.
+
+        One request filtered by the five series IDs in US_RIG_SERIES.
+        """
+        async def fetch() -> dict[str, Any]:
+            # 5 series × 60 months = 300 rows.
+            rows = await self._fetch_eia_series(
+                _ROUTE_DRILL,
+                {"series": list(US_RIG_SERIES.keys())},
+                frequency="monthly", length=300,
+            )
+
+            by_period: dict[str, dict[str, int]] = {}
+            for row in rows:
+                period = row.get("period", "")
+                label  = US_RIG_SERIES.get(row.get("series", ""))
+                if not period or not label:
+                    continue
+                try:
+                    val = int(float(row["value"]))
+                except (TypeError, ValueError):
+                    continue
+                by_period.setdefault(period, {})[label] = val
+
+            history = [
+                {
+                    "date":     f"{p}-01",
+                    "total":    by_period[p].get("total"),
+                    "oil":      by_period[p].get("oil"),
+                    "gas":      by_period[p].get("gas"),
+                    "onshore":  by_period[p].get("onshore"),
+                    "offshore": by_period[p].get("offshore"),
+                }
+                for p in sorted(by_period.keys(), reverse=True)
+            ]
+
+            latest = history[0] if history else {}
+            prev   = history[1] if len(history) > 1 else {}
+            yr_ago = history[12] if len(history) > 12 else {}
+
+            def _diff(a: int | None, b: int | None) -> int | None:
+                return (a - b) if (a is not None and b is not None) else None
+
+            return {
+                "latest_total": latest.get("total"),
+                "latest_oil":   latest.get("oil"),
+                "latest_gas":   latest.get("gas"),
+                "mom_change":   _diff(latest.get("total"), prev.get("total")),
+                "yoy_change":   _diff(latest.get("total"), yr_ago.get("total")),
+                "history":      history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:us_rig_count_v1", fetch, ttl=21600)
+
+    async def get_us_production_by_region(self) -> dict[str, Any]:
+        """Monthly crude production by state/PADD/region — 36 months for small multiples."""
+        async def fetch() -> dict[str, Any]:
+            # 6 regions × 2 unit rows × 36 months ≈ 430 rows; request 500.
+            # crpdn returns both MBBL (monthly total) and MBBL/D rows — filter
+            # to the per-day rate so we don't accidentally store volume totals.
+            rows_raw = await self._fetch_eia_series(
+                _ROUTE_MONTHLY_PRODUCTION,
+                {
+                    "duoarea": list(US_PRODUCTION_REGIONS.keys()),
+                    "product": ["EPC0"],
+                    "process": ["FPF"],
+                },
+                frequency="monthly", length=500,
+            )
+            rows = [r for r in rows_raw if r.get("units") == "MBBL/D"]
+
             by_period: dict[str, dict[str, float]] = {}
             for row in rows:
                 period = row.get("period", "")
-                label = MONTHLY_PROD_AREAS.get(row.get("duoarea", ""))
+                label  = US_PRODUCTION_REGIONS.get(row.get("duoarea", ""))
                 if not period or not label:
                     continue
                 try:
                     val = float(row["value"])
                 except (TypeError, ValueError):
                     continue
-                by_period.setdefault(period, {})[label] = val
+                by_period.setdefault(period, {})[label] = round(val / 1000, 3)
 
-            history = []
-            for period in sorted(by_period.keys(), reverse=True):
-                d = by_period[period]
-                history.append({
-                    "date":     f"{period}-01",
-                    "us_total": round(d["us_total"] / 1000, 3) if "us_total" in d else None,
-                    "padd3":    round(d["padd3"]    / 1000, 3) if "padd3"    in d else None,
-                    "padd2":    round(d["padd2"]    / 1000, 3) if "padd2"    in d else None,
-                    "gom":      round(d["gom"]      / 1000, 3) if "gom"      in d else None,
-                })
-            return {"monthly_history": history}
+            sorted_periods = sorted(by_period.keys(), reverse=True)
+            history = [
+                {"date": f"{p}-01", **{lbl: by_period[p].get(lbl) for lbl in US_PRODUCTION_REGIONS.values()}}
+                for p in sorted_periods
+            ]
 
-        return await get_cache().cache_or_fetch("eia:us_production_monthly_v1", fetch, ttl=86400)
-
-    async def get_duc_wells(self) -> dict[str, Any]:
-        """Monthly DUC well counts by basin — EIA DPR, 36 months.
-
-        length=288 = 8 areas × 36 months.
-        Signal: DRAW if US MoM < -50, BUILD if > +50, else NEUTRAL.
-        """
-        async def fetch() -> dict[str, Any]:
-            rows = await self._fetch_eia_series(
-                _ROUTE_DUC, DUC_FACETS, frequency="monthly", length=288,
-            )
-
-            by_area: dict[str, list[tuple[str, int]]] = {label: [] for label in DUC_AREAS.values()}
-            for row in rows:
-                label = DUC_AREAS.get(row.get("duoarea", ""))
-                if not label:
-                    continue
-                try:
-                    val = int(float(row["value"]))
-                except (TypeError, ValueError):
-                    continue
-                by_area[label].append((row["period"], val))
-
-            for label in by_area:
-                by_area[label].sort(key=lambda x: x[0], reverse=True)
-
-            total_series = by_area.get("total", [])
-            latest_total    = total_series[0][1]  if total_series            else None
-            prev_total      = total_series[1][1]  if len(total_series) >  1  else None
-            year_ago_total  = total_series[12][1] if len(total_series) > 12  else None
-
-            mom_change = (latest_total - prev_total)     if (latest_total is not None and prev_total     is not None) else None
-            yoy_change = (latest_total - year_ago_total) if (latest_total is not None and year_ago_total is not None) else None
-            mom_pct = round(mom_change / prev_total     * 100, 1) if (mom_change is not None and prev_total)     else None
-            yoy_pct = round(yoy_change / year_ago_total * 100, 1) if (yoy_change is not None and year_ago_total) else None
-
-            if mom_change is not None:
-                signal = "DRAW" if mom_change < -50 else "BUILD" if mom_change > 50 else "NEUTRAL"
-            else:
-                signal = "NEUTRAL"
-
-            all_periods = sorted({p for series in by_area.values() for p, _ in series}, reverse=True)
-            by_period_basin: dict[str, dict[str, int]] = {}
-            for label, series in by_area.items():
-                for period, val in series:
-                    by_period_basin.setdefault(period, {})[label] = val
-
-            history = []
-            for period in all_periods[:36]:
-                d = by_period_basin.get(period, {})
-                history.append({
-                    "date":        f"{period}-01",
-                    "total":       d.get("total"),
-                    "permian":     d.get("permian"),
-                    "eagle_ford":  d.get("eagle_ford"),
-                    "bakken":      d.get("bakken"),
-                    "niobrara":    d.get("niobrara"),
-                    "appalachia":  d.get("appalachia"),
-                    "anadarko":    d.get("anadarko"),
-                    "haynesville": d.get("haynesville"),
-                })
-
-            basins: dict[str, dict[str, Any]] = {}
-            for basin_label in ["permian", "eagle_ford", "bakken", "niobrara", "appalachia", "anadarko", "haynesville"]:
-                series = by_area.get(basin_label, [])
-                current = series[0][1] if series           else None
-                prev    = series[1][1] if len(series) > 1 else None
-                basins[basin_label] = {
+            regions: dict[str, dict[str, float | None]] = {}
+            for label in US_PRODUCTION_REGIONS.values():
+                series = [by_period[p].get(label) for p in sorted_periods]
+                series = [v for v in series if v is not None]
+                current = series[0]  if series             else None
+                prev    = series[1]  if len(series) > 1   else None
+                yr_ago  = series[12] if len(series) > 12  else None
+                regions[label] = {
                     "current":    current,
-                    "mom_change": (current - prev) if (current is not None and prev is not None) else None,
+                    "mom_change": round(current - prev,   3) if (current is not None and prev    is not None) else None,
+                    "yoy_change": round(current - yr_ago, 3) if (current is not None and yr_ago  is not None) else None,
                 }
 
+            return {"regions": regions, "history": history}
+
+        return await get_cache().cache_or_fetch("eia:us_prod_by_region_v1", fetch, ttl=21600)
+
+    async def get_us_api_gravity(self) -> dict[str, Any]:
+        """Lower-48 crude production by API gravity bucket — summed across states, monthly.
+
+        EIA publishes gravity-bucket data at state level only; we aggregate 15
+        states + the R98 "Other" group server-side to get an L48 view. The
+        endpoint times out on the full state list, so we split the query in
+        two halves and merge.
+        """
+        async def fetch() -> dict[str, Any]:
+            half = len(API_GRAVITY_STATES) // 2
+            states_a, states_b = API_GRAVITY_STATES[:half], API_GRAVITY_STATES[half:]
+            results = await asyncio.gather(
+                self._fetch_eia_series(
+                    _ROUTE_API_GRAVITY,
+                    {"duoarea": states_a, "product": list(API_GRAVITY_BUCKETS.keys())},
+                    frequency="monthly", length=2000,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_API_GRAVITY,
+                    {"duoarea": states_b, "product": list(API_GRAVITY_BUCKETS.keys())},
+                    frequency="monthly", length=2000,
+                ),
+                return_exceptions=True,
+            )
+            rows: list[dict[str, Any]] = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.warning("eia.us_api_gravity: half %d failed: %s", i, r)
+                else:
+                    rows.extend(r)  # type: ignore[arg-type]
+
+            # Sum per (period, bucket) across states.
+            by_period_bucket: dict[str, dict[str, float]] = {}
+            for row in rows:
+                period = row.get("period", "")
+                bucket = API_GRAVITY_BUCKETS.get(row.get("product", ""))
+                if not period or not bucket:
+                    continue
+                try:
+                    val = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                by_period_bucket.setdefault(period, {}).setdefault(bucket, 0.0)
+                by_period_bucket[period][bucket] += val
+
+            sorted_periods = sorted(by_period_bucket.keys(), reverse=True)
+            # Only keep periods where at least one bucket reported (avoids
+            # leading months that haven't been published yet).
+            sorted_periods = [p for p in sorted_periods if by_period_bucket[p]]
+            history = [
+                {
+                    "date":       f"{p}-01",
+                    "heavy":      round(by_period_bucket[p].get("heavy",      0.0) / 1000, 3) or None,
+                    "medium":     round(by_period_bucket[p].get("medium",     0.0) / 1000, 3) or None,
+                    "light":      round(by_period_bucket[p].get("light",      0.0) / 1000, 3) or None,
+                    "condensate": round(by_period_bucket[p].get("condensate", 0.0) / 1000, 3) or None,
+                }
+                for p in sorted_periods[:36]
+            ]
+
+            latest = history[0] if history else {}
+            total  = sum(v for v in (latest.get("heavy"), latest.get("medium"), latest.get("light"), latest.get("condensate")) if v) or None
+
+            def _pct(bucket: str) -> float | None:
+                v = latest.get(bucket)
+                if not v or not total:
+                    return None
+                return round(v / total * 100, 1)
+
             return {
-                "total_duc":  latest_total,
-                "mom_change": mom_change,
-                "mom_pct":    mom_pct,
-                "yoy_change": yoy_change,
-                "yoy_pct":    yoy_pct,
-                "signal":     signal,
-                "history":    history,
-                "basins":     basins,
+                "latest_heavy_pct":      _pct("heavy"),
+                "latest_medium_pct":     _pct("medium"),
+                "latest_light_pct":      _pct("light"),
+                "latest_condensate_pct": _pct("condensate"),
+                "history": history,
             }
 
-        return await get_cache().cache_or_fetch("eia:duc_wells_v1", fetch, ttl=86400)
+        return await get_cache().cache_or_fetch("eia:us_api_gravity_v1", fetch, ttl=86400)
 
-    async def get_crude_imports(self) -> dict[str, Any]:
-        """Monthly U.S. crude imports by country of origin — top 10, last 12 months.
+    async def get_us_crude_imports(self) -> dict[str, Any]:
+        """Crude imports by country — weekly preliminary + monthly final, both bundled."""
+        async def fetch() -> dict[str, Any]:
+            # Monthly feed: constrain to destinationType=US so we get the
+            # already-aggregated US-total row per origin (still split by grade,
+            # which we sum in _build_monthly_imports). If either feed errors,
+            # the other still renders.
+            weekly_rows, monthly_rows = await asyncio.gather(
+                self._fetch_eia_series(
+                    _ROUTE_WEEKLY_IMPORTS_CTY,
+                    {"product": ["EPC0"], "process": ["IM0"]},
+                    frequency="weekly", length=400,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_CRUDE_IMPORTS,
+                    {"originType": ["CTY"], "destinationType": ["US"]},
+                    frequency="monthly", length=2000,
+                    data_columns=["quantity"],
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(weekly_rows, Exception):
+                logger.warning("eia.us_crude_imports: weekly failed: %s", weekly_rows)
+                weekly_rows = []
+            if isinstance(monthly_rows, Exception):
+                logger.warning("eia.us_crude_imports: monthly failed: %s", monthly_rows)
+                monthly_rows = []
+            return {
+                "weekly_preliminary": self._build_weekly_imports(weekly_rows),
+                "monthly_final":      self._build_monthly_imports(monthly_rows),
+            }
 
-        EIA crude-oil-imports returns quantity in thousand barrels (total, not per day).
-        Converts to MBD using a 30.5-day average month.
-        length=500 covers ~12 months × ~40 active origin countries with buffer.
+        return await get_cache().cache_or_fetch("eia:us_crude_imports_v1", fetch, ttl=3600)
+
+    @staticmethod
+    def _build_weekly_imports(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate wimpc rows into latest top-10 + 26-week history total."""
+        # Group by (period, country_iso) where country_iso is the area-name field.
+        by_period: dict[str, dict[str, float]] = {}
+        for row in rows:
+            period = row.get("period", "")
+            iso    = row.get("area-name") or row.get("duoarea-name") or ""
+            if not period or not iso:
+                continue
+            try:
+                val = float(row.get("value") or 0)
+            except (TypeError, ValueError):
+                continue
+            by_period.setdefault(period, {})
+            by_period[period][iso] = by_period[period].get(iso, 0.0) + val
+
+        sorted_periods = sorted(by_period.keys(), reverse=True)
+        if not sorted_periods:
+            return {"total_mbd": None, "top_origins": [], "history": []}
+
+        latest = by_period[sorted_periods[0]]
+        prev   = by_period.get(sorted_periods[1], {}) if len(sorted_periods) > 1 else {}
+        total  = sum(latest.values())
+
+        top = sorted(latest.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_origins = [
+            {
+                "country":      iso,
+                "volume_mbd":   round(vol / 1000, 3),
+                "share_pct":    round(vol / total * 100, 1) if total else 0.0,
+                "mom_change":   round((vol - prev.get(iso, 0.0)) / 1000, 3) if prev else None,
+                "is_opec_plus": iso in OPEC_PLUS_ISO3,
+            }
+            for iso, vol in top
+        ]
+        history = [
+            {"date": p, "value": round(sum(by_period[p].values()) / 1000, 3)}
+            for p in sorted_periods[:26]
+        ]
+        return {
+            "total_mbd":   round(total / 1000, 3),
+            "top_origins": top_origins,
+            "history":     history,
+        }
+
+    @staticmethod
+    def _build_monthly_imports(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate crude-oil-imports rows (CTY-typed) into top-10 + 12-month history.
+
+        crude-oil-imports returns `quantity` in thousand barrels per month, not
+        per day. Convert to MBD with a 30.5-day reference month.
+        """
+        _DAYS = 30.5
+
+        by_period: dict[str, dict[str, float]] = {}
+        for row in rows:
+            period = row.get("period", "")
+            origin = row.get("originName") or row.get("originId") or ""
+            if not period or not origin:
+                continue
+            try:
+                qty = float(row.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            by_period.setdefault(period, {})
+            by_period[period][origin] = by_period[period].get(origin, 0.0) + qty
+
+        sorted_periods = sorted(by_period.keys(), reverse=True)
+        if not sorted_periods:
+            return {"total_mbd": None, "top_origins": [], "history": []}
+
+        latest = by_period[sorted_periods[0]]
+        prev   = by_period.get(sorted_periods[1], {}) if len(sorted_periods) > 1 else {}
+        total_kbbl = sum(latest.values())
+        total_mbd  = total_kbbl / _DAYS / 1000
+
+        top = sorted(latest.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_origins = [
+            {
+                "country":      country,
+                "volume_mbd":   round(vol / _DAYS / 1000, 3),
+                "share_pct":    round(vol / total_kbbl * 100, 1) if total_kbbl else 0.0,
+                "mom_change":   round((vol - prev.get(country, 0.0)) / _DAYS / 1000, 3) if prev else None,
+                "is_opec_plus": country in OPEC_PLUS_NAMES,
+            }
+            for country, vol in top
+        ]
+        history = [
+            {"date": f"{p}-01", "value": round(sum(by_period[p].values()) / _DAYS / 1000, 3)}
+            for p in sorted_periods[:12]
+        ]
+        return {
+            "total_mbd":   round(total_mbd, 3),
+            "top_origins": top_origins,
+            "history":     history,
+        }
+
+    async def get_us_natural_gas(self) -> dict[str, Any]:
+        """Monthly US natural gas — gross withdrawals + dry production, 5Y history.
+
+        Unit handling is asymmetric on this route:
+          * FGW (gross withdrawals) is published in both MMCF (monthly total)
+            and MMCF/D (per-day rate) — use the MMCF/D row.
+          * FPD (dry production) is published in MMCF only — convert with a
+            30.5-day reference month.
+        Both flow into Bcf/d (divide MMcf/d by 1000).
         """
         _DAYS = 30.5
 
         async def fetch() -> dict[str, Any]:
             rows = await self._fetch_eia_series(
-                _ROUTE_CRUDE_IMPORTS,
-                {},
-                frequency="monthly",
-                length=500,
-                data_columns=["quantity"],
+                _ROUTE_NG_PRODUCTION,
+                {"duoarea": ["NUS"], "process": [NG_PROCESS_GROSS, NG_PROCESS_DRY]},
+                frequency="monthly", length=300,
             )
 
             by_period: dict[str, dict[str, float]] = {}
             for row in rows:
                 period = row.get("period", "")
-                origin = row.get("originName", "")
-                if not period or not origin:
+                proc   = row.get("process", "")
+                units  = row.get("units", "")
+                if not period:
                     continue
                 try:
-                    qty = float(row.get("quantity") or 0)
+                    val = float(row["value"])
                 except (TypeError, ValueError):
                     continue
-                by_period.setdefault(period, {}).setdefault(origin, 0.0)
-                by_period[period][origin] += qty
+                if proc == NG_PROCESS_GROSS and units == "MMCF/D":
+                    by_period.setdefault(period, {})["gross"] = val
+                elif proc == NG_PROCESS_DRY and units == "MMCF":
+                    by_period.setdefault(period, {})["dry"] = val / _DAYS
 
             sorted_periods = sorted(by_period.keys(), reverse=True)
-            if not sorted_periods:
-                return {"total_imports_mbd": None, "top_origins": [], "history_total": []}
-
-            latest_data = by_period[sorted_periods[0]]
-            prev_data   = by_period.get(sorted_periods[1], {}) if len(sorted_periods) > 1 else {}
-
-            total_kbbl  = sum(latest_data.values())
-            total_mbd   = round(total_kbbl / _DAYS / 1000, 2)
-
-            sorted_origins = sorted(latest_data.items(), key=lambda x: x[1], reverse=True)
-            top_origins: list[dict[str, Any]] = []
-            for country, volume_kbbl in sorted_origins[:10]:
-                volume_mbd = round(volume_kbbl / _DAYS / 1000, 2)
-                share_pct  = round(volume_kbbl / total_kbbl * 100, 1) if total_kbbl else 0.0
-                prev_mbd   = round(prev_data.get(country, 0) / _DAYS / 1000, 2) if prev_data else None
-                mom_change = round(volume_mbd - prev_mbd, 2) if prev_mbd is not None else None
-                top_origins.append({
-                    "country":    country,
-                    "volume_mbd": volume_mbd,
-                    "share_pct":  share_pct,
-                    "mom_change": mom_change,
-                })
-
-            history_total = [
+            history = [
                 {
-                    "date":  f"{p}-01",
-                    "value": round(sum(by_period[p].values()) / _DAYS / 1000, 2),
+                    "date":              f"{p}-01",
+                    "gross_withdrawals": round(by_period[p].get("gross", 0) / 1000, 3) or None,
+                    "dry_production":    round(by_period[p].get("dry",   0) / 1000, 3) or None,
                 }
-                for p in sorted_periods[:12]
+                for p in sorted_periods[:60]
             ]
 
+            latest = history[0]  if history             else {}
+            yr_ago = history[12] if len(history) > 12   else {}
+            yoy_pct: float | None = None
+            if latest.get("gross_withdrawals") and yr_ago.get("gross_withdrawals"):
+                yoy_pct = round(
+                    (latest["gross_withdrawals"] - yr_ago["gross_withdrawals"])
+                    / yr_ago["gross_withdrawals"] * 100,
+                    2,
+                )
+
             return {
-                "total_imports_mbd": total_mbd,
-                "top_origins":       top_origins,
-                "history_total":     history_total,
+                "latest_gross_withdrawals": latest.get("gross_withdrawals"),
+                "latest_dry_production":    latest.get("dry_production"),
+                "yoy_change_pct":           yoy_pct,
+                "history":                  history,
             }
 
-        return await get_cache().cache_or_fetch("eia:crude_imports_v1", fetch, ttl=86400)
+        return await get_cache().cache_or_fetch("eia:us_natural_gas_v1", fetch, ttl=21600)
+
+    async def get_us_reserves(self) -> dict[str, Any]:
+        """Annual US proved reserves — crude (BBbl) and dry natural gas (Tcf)."""
+        async def fetch() -> dict[str, Any]:
+            # Process codes: R01 = crude proved reserves at end of year (pres).
+            # R11 = "Dry, Expected Future Production" = proved dry-gas reserves
+            # (enr/dry). Other R-codes on these routes are reserves changes.
+            crude_rows, ng_rows = await asyncio.gather(
+                self._fetch_eia_series(
+                    _ROUTE_CRUDE_RESERVES,
+                    {"duoarea": ["NUS"], "product": ["EPC0"], "process": ["R01"]},
+                    frequency="annual", length=30,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_NG_RESERVES,
+                    {"duoarea": ["NUS"], "process": ["R11"]},
+                    frequency="annual", length=30,
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(crude_rows, Exception):
+                logger.warning("eia.us_reserves: crude failed: %s", crude_rows)
+                crude_rows = []
+            if isinstance(ng_rows, Exception):
+                logger.warning("eia.us_reserves: ng failed: %s", ng_rows)
+                ng_rows = []
+
+            def _build_history(rows: list[dict[str, Any]], divisor: float) -> list[dict[str, Any]]:
+                history: list[dict[str, Any]] = []
+                for row in rows:
+                    try:
+                        val = float(row["value"])
+                    except (TypeError, ValueError):
+                        continue
+                    history.append({"year": row["period"], "value": round(val / divisor, 3)})
+                history.sort(key=lambda x: x["year"], reverse=True)
+                return history
+
+            # Crude pres units are MMBBL (million bbl) → /1000 → billion bbl.
+            # NG enr/dry units are BCF (billion cf) → /1000 → trillion cf.
+            crude_history = _build_history(crude_rows, 1000.0)
+            ng_history    = _build_history(ng_rows,    1000.0)
+
+            return {
+                "crude_latest_year": crude_history[0]["year"]  if crude_history else None,
+                "crude_proved_bbbl": crude_history[0]["value"] if crude_history else None,
+                "ng_latest_year":    ng_history[0]["year"]     if ng_history    else None,
+                "ng_proved_tcf":     ng_history[0]["value"]    if ng_history    else None,
+                "crude_history":     crude_history,
+                "ng_history":        ng_history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:us_reserves_v1", fetch, ttl=604800)
+
+    # =========================================================================
+    # Upstream — OPEC+ subtab
+    # =========================================================================
+
+    async def get_opec_production(self) -> dict[str, Any]:
+        """Monthly OPEC+ crude production — hero KPIs, country table, 36M sparklines.
+
+        Fetches 21 members × 36 months from EIA international in one request.
+        Values are in MBD (input is TBPD from EIA, /1000). Returned newest-first
+        so the frontend's toLwPoints() can reverse for chart consumption.
+        """
+        async def fetch() -> dict[str, Any]:
+            # 21 countries × 36 months + generous buffer = 800 rows.
+            rows = await self._fetch_eia_series(
+                _ROUTE_INTERNATIONAL,
+                {
+                    "countryRegionId": list(OPEC_PLUS_PROD_MEMBERS.keys()),
+                    "productId":       [_INTL_PRODUCT_ID],
+                    "activityId":      [_INTL_ACTIVITY_ID],
+                },
+                frequency="monthly", length=800,
+            )
+
+            # Build lookup: {period: {iso3: value_tbpd}}
+            by_period_country: dict[str, dict[str, float]] = {}
+            for row in rows:
+                period = row.get("period", "")
+                iso3   = row.get("countryRegionId", "")
+                if not period or iso3 not in OPEC_PLUS_PROD_MEMBERS:
+                    continue
+                try:
+                    val = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                by_period_country.setdefault(period, {})[iso3] = val
+
+            sorted_periods = sorted(by_period_country.keys(), reverse=True)
+            if not sorted_periods:
+                return {"hero": {}, "table": [], "sparklines": {}}
+
+            latest_p   = sorted_periods[0]
+            prev_p     = sorted_periods[1]  if len(sorted_periods) > 1  else None
+            yr_ago_p   = sorted_periods[12] if len(sorted_periods) > 12 else None
+
+            latest = by_period_country[latest_p]
+            prev   = by_period_country.get(prev_p,   {}) if prev_p   else {}
+            yr_ago = by_period_country.get(yr_ago_p, {}) if yr_ago_p else {}
+
+            total_tbpd = sum(latest.values())
+
+            def _mbd(iso: str, src: dict[str, float]) -> float | None:
+                v = src.get(iso)
+                return round(v / 1000, 3) if v is not None else None
+
+            def _mom_mbd(iso: str) -> float | None:
+                cur, prv = latest.get(iso), prev.get(iso)
+                return round((cur - prv) / 1000, 3) if (cur is not None and prv is not None) else None
+
+            hero: dict[str, Any] = {
+                "total_mbd":     round(total_tbpd / 1000, 3),
+                "total_mom":     round((total_tbpd - sum(prev.values())) / 1000, 3) if prev else None,
+                "latest_period": latest_p,
+                "saudi_mbd":     _mbd("SAU", latest),
+                "saudi_mom":     _mom_mbd("SAU"),
+                "russia_mbd":    _mbd("RUS", latest),
+                "russia_mom":    _mom_mbd("RUS"),
+                "iraq_mbd":      _mbd("IRQ", latest),
+                "iraq_mom":      _mom_mbd("IRQ"),
+            }
+
+            table: list[dict[str, Any]] = []
+            for iso3, display_name in OPEC_PLUS_PROD_MEMBERS.items():
+                cur = latest.get(iso3)
+                if cur is None:
+                    continue
+                prv = prev.get(iso3)
+                yra = yr_ago.get(iso3)
+                table.append({
+                    "iso3":       iso3,
+                    "country":    display_name,
+                    "latest_mbd": round(cur / 1000, 3),
+                    "mom":        round((cur - prv) / 1000, 3)        if prv is not None else None,
+                    "mom_pct":    round((cur - prv) / prv * 100, 2)   if (prv and prv > 0) else None,
+                    "yoy":        round((cur - yra) / 1000, 3)        if yra is not None else None,
+                    "yoy_pct":    round((cur - yra) / yra * 100, 2)   if (yra and yra > 0) else None,
+                    "share_pct":  round(cur / total_tbpd * 100, 1)    if total_tbpd else None,
+                })
+            table.sort(key=lambda x: x["latest_mbd"], reverse=True)
+
+            # Sparklines: newest-first (toLwPoints reverses on the frontend).
+            sparklines: dict[str, list[dict[str, Any]]] = {}
+            for p in sorted_periods[:36]:
+                for iso3, val in by_period_country[p].items():
+                    if iso3 in OPEC_PLUS_PROD_MEMBERS:
+                        sparklines.setdefault(iso3, []).append({
+                            "period": f"{p}-01",
+                            "value":  round(val / 1000, 3),
+                        })
+
+            return {"hero": hero, "table": table, "sparklines": sparklines}
+
+        return await get_cache().cache_or_fetch("eia:opec_production_v1", fetch, ttl=21600)
+
+    async def get_opec_history(self) -> dict[str, Any]:
+        """Monthly OPEC+ crude production — all members, 10Y history for stacked area.
+
+        Returns per-member lists, newest-first, in MBD. Frontend reverses for LWCharts.
+        Request is one shot (21 × 120 = 2520 rows) — EIA international handles this
+        in a single page at the given length.
+        """
+        async def fetch() -> dict[str, Any]:
+            rows = await self._fetch_eia_series(
+                _ROUTE_INTERNATIONAL,
+                {
+                    "countryRegionId": list(OPEC_PLUS_PROD_MEMBERS.keys()),
+                    "productId":       [_INTL_PRODUCT_ID],
+                    "activityId":      [_INTL_ACTIVITY_ID],
+                },
+                frequency="monthly", length=2600,
+            )
+
+            by_period_country: dict[str, dict[str, float]] = {}
+            for row in rows:
+                period = row.get("period", "")
+                iso3   = row.get("countryRegionId", "")
+                if not period or iso3 not in OPEC_PLUS_PROD_MEMBERS:
+                    continue
+                try:
+                    val = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                by_period_country.setdefault(period, {})[iso3] = val
+
+            sorted_periods = sorted(by_period_country.keys(), reverse=True)[:120]
+
+            # Build {iso3: [{period, value}]} newest-first.
+            members: dict[str, list[dict[str, Any]]] = {}
+            for p in sorted_periods:
+                for iso3, val in by_period_country[p].items():
+                    if iso3 in OPEC_PLUS_PROD_MEMBERS:
+                        members.setdefault(iso3, []).append({
+                            "period": f"{p}-01",
+                            "value":  round(val / 1000, 3),
+                        })
+
+            return {"members": members, "periods_available": len(sorted_periods)}
+
+        return await get_cache().cache_or_fetch("eia:opec_history_v1", fetch, ttl=86400)
