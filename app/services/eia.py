@@ -9,7 +9,10 @@ Series-filter constants are defined at module level — verify or explore codes 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -40,6 +43,7 @@ _ROUTE_NG_RESERVES        = "natural-gas/enr/dry"  # dry NG proved reserves (ann
 
 # Upstream — OPEC+ subtab
 _ROUTE_INTERNATIONAL      = "international"         # country-level production (monthly)
+_ROUTE_STEO               = "steo"                 # Short-Term Energy Outlook (monthly + 18M forecast)
 
 # =============================================================================
 # Series filter constants — EIA v2 facet parameters
@@ -258,12 +262,21 @@ NG_PROCESS_DRY   = "FPD"
 # Upstream — OPEC+ subtab constants
 # =============================================================================
 
-# international — EIA v2 facets for crude-oil production by country.
-#   productId=55  = Crude oil + lease condensate (Thousand Barrels per Day)
-#   activityId=1  = Production
+# international — EIA v2 facets for production by country (Thousand Bbl/Day).
+#   productId=57 = Crude oil + lease condensate — the OPEC+ quota basis ("crude")
+#   productId=55 = Crude oil, NGPL, and other liquids — total liquids ("liquids")
+#   activityId=1 = Production
 # Verify / explore at: https://www.eia.gov/opendata/browser/international
-_INTL_PRODUCT_ID  = "55"
-_INTL_ACTIVITY_ID = "1"
+_INTL_PRODUCT_CRUDE   = "57"
+_INTL_PRODUCT_LIQUIDS = "55"
+_INTL_ACTIVITY_ID     = "1"
+
+# Subtab "basis" toggle → EIA international productId. Crude is the default
+# because OPEC+ quotas/cuts are defined on crude oil + lease condensate.
+_INTL_PRODUCT_BY_BASIS: dict[str, str] = {
+    "crude":   _INTL_PRODUCT_CRUDE,
+    "liquids": _INTL_PRODUCT_LIQUIDS,
+}
 
 # OPEC+ member ISO-3 codes → display names, ordered by typical production level.
 # Core OPEC (12 members after Angola's 2024 exit) + non-OPEC+ partners.
@@ -290,6 +303,70 @@ OPEC_PLUS_PROD_MEMBERS: dict[str, str] = {
     "SSD": "South Sudan",
     "BHR": "Bahrain",
 }
+
+# ---------------------------------------------------------------------------
+# STEO series for the OPEC+ overview. STEO values are ALREADY mb/d (do not /1000).
+# Overview is basis-independent — capacity/spare/splits are all crude (no liquids
+# equivalent exists in STEO). All crude basis here.
+# ---------------------------------------------------------------------------
+_STEO_CAPACITY = "COPC_OPEC"          # OPEC total crude production capacity
+_STEO_SPARE    = "COPS_OPEC"          # OPEC total spare crude capacity
+_STEO_BALANCE  = "T3_STCHANGE_WORLD"  # World net inventory withdrawals (mb/d; <0 = build = surplus)
+
+# Structural split (crude): OPEC total, OPEC+ other participants, non-OPEC+ ex-US.
+_STEO_SPLIT_OPEC       = "COPR_OPEC"
+_STEO_SPLIT_OPEC_OTHER = "COPR_OPECPLUS_OTHER"
+_STEO_SPLIT_NON        = "COPR_NONOPECPLUS_XUS"
+
+# Unplanned production disruptions (PADI_*, mb/d) — OPEC+ members / key disruptors
+# that have a STEO series. STEO uses its own country codes (not ISO-3).
+_STEO_PADI: dict[str, str] = {
+    "PADI_RS": "Russia",
+    "PADI_IR": "Iran",
+    "PADI_LY": "Libya",
+    "PADI_VE": "Venezuela",
+    "PADI_NI": "Nigeria",
+    "PADI_IZ": "Iraq",
+    "PADI_KU": "Kuwait",
+    "PADI_SA": "Saudi Arabia",
+    "PADI_MX": "Mexico",
+    "PADI_AJ": "Azerbaijan",
+    "PADI_GB": "Gabon",
+    "PADI_SU": "Sudan & S. Sudan",
+}
+
+# Hand-maintained OPEC+ required-production quotas (mb/d crude). Update after
+# each monthly OPEC+ meeting. Loaded via a function so tests can patch it.
+_QUOTA_PATH = Path(__file__).resolve().parent.parent / "data" / "opec_plus_quotas.json"
+
+
+def _load_opec_quotas() -> dict[str, Any]:
+    """Load OPEC+ required-production quotas from app/data/opec_plus_quotas.json."""
+    try:
+        with open(_QUOTA_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("OPEC quota file missing/invalid: %s", _QUOTA_PATH)
+        return {"as_of": None, "source": None, "required_mbd": {}}
+
+
+# JODI-Oil free annual CSVs. Only these 5 OPEC members report crude production to
+# JODI (Iraq, UAE, Iran, Libya, Congo, Gabon, Eq. Guinea don't), so the cross-check
+# compares EIA vs JODI on this same set — apples to apples. JODI ISO-2 → EIA ISO-3.
+_JODI_BASE = "https://www.jodidata.org/_resources/files/downloads/oil-data/annual-csv/primary"
+_JODI_OPEC: dict[str, str] = {
+    "SA": "SAU",
+    "KW": "KWT",
+    "NG": "NGA",
+    "DZ": "DZA",
+    "VE": "VEN",
+}
+
+
+def _jodi_csv_urls() -> list[str]:
+    """Recent JODI primary CSVs: current year (primaryyear{Y}.csv) + prior ({Y-1}.csv)."""
+    y = datetime.now(timezone.utc).year
+    return [f"{_JODI_BASE}/primaryyear{y}.csv", f"{_JODI_BASE}/{y - 1}.csv"]
 
 # Legacy product-code constants kept for the existing /api/downstream endpoint.
 SPOT_PRODUCTS_FULL: dict[str, str] = {
@@ -1098,20 +1175,26 @@ class EIAService:
     # Upstream — OPEC+ subtab
     # =========================================================================
 
-    async def get_opec_production(self) -> dict[str, Any]:
-        """Monthly OPEC+ crude production — hero KPIs, country table, 36M sparklines.
+    async def get_opec_production(self, basis: str = "crude") -> dict[str, Any]:
+        """Monthly OPEC+ production — hero KPIs, country table, 36M sparklines.
 
         Fetches 21 members × 36 months from EIA international in one request.
         Values are in MBD (input is TBPD from EIA, /1000). Returned newest-first
         so the frontend's toLwPoints() can reverse for chart consumption.
+
+        basis: "crude" (productId 57, crude+condensate — default) or "liquids"
+               (productId 55, total liquids incl. NGPL).
         """
+        basis = basis if basis in _INTL_PRODUCT_BY_BASIS else "crude"
+        product_id = _INTL_PRODUCT_BY_BASIS[basis]
+
         async def fetch() -> dict[str, Any]:
             # 21 countries × 36 months + generous buffer = 800 rows.
             rows = await self._fetch_eia_series(
                 _ROUTE_INTERNATIONAL,
                 {
                     "countryRegionId": list(OPEC_PLUS_PROD_MEMBERS.keys()),
-                    "productId":       [_INTL_PRODUCT_ID],
+                    "productId":       [product_id],
                     "activityId":      [_INTL_ACTIVITY_ID],
                 },
                 frequency="monthly", length=800,
@@ -1195,21 +1278,28 @@ class EIAService:
 
             return {"hero": hero, "table": table, "sparklines": sparklines}
 
-        return await get_cache().cache_or_fetch("eia:opec_production_v1", fetch, ttl=21600)
+        # v2 + basis suffix: v1 served productId 55 (total liquids) mislabeled as
+        # crude — bust it, and cache crude/liquids independently.
+        return await get_cache().cache_or_fetch(f"eia:opec_production_v2:{basis}", fetch, ttl=21600)
 
-    async def get_opec_history(self) -> dict[str, Any]:
-        """Monthly OPEC+ crude production — all members, 10Y history for stacked area.
+    async def get_opec_history(self, basis: str = "crude") -> dict[str, Any]:
+        """Monthly OPEC+ production — all members, 10Y history for stacked area.
 
         Returns per-member lists, newest-first, in MBD. Frontend reverses for LWCharts.
         Request is one shot (21 × 120 = 2520 rows) — EIA international handles this
         in a single page at the given length.
+
+        basis: "crude" (productId 57 — default) or "liquids" (productId 55).
         """
+        basis = basis if basis in _INTL_PRODUCT_BY_BASIS else "crude"
+        product_id = _INTL_PRODUCT_BY_BASIS[basis]
+
         async def fetch() -> dict[str, Any]:
             rows = await self._fetch_eia_series(
                 _ROUTE_INTERNATIONAL,
                 {
                     "countryRegionId": list(OPEC_PLUS_PROD_MEMBERS.keys()),
-                    "productId":       [_INTL_PRODUCT_ID],
+                    "productId":       [product_id],
                     "activityId":      [_INTL_ACTIVITY_ID],
                 },
                 frequency="monthly", length=2600,
@@ -1241,4 +1331,349 @@ class EIAService:
 
             return {"members": members, "periods_available": len(sorted_periods)}
 
-        return await get_cache().cache_or_fetch("eia:opec_history_v1", fetch, ttl=86400)
+        # v2 + basis suffix — see get_opec_production note.
+        return await get_cache().cache_or_fetch(f"eia:opec_history_v2:{basis}", fetch, ttl=86400)
+
+    async def _opec_actual_cutoff(self) -> str:
+        """Latest OPEC actual month (YYYY-MM) from EIA international.
+
+        Used as the actual/forecast boundary for STEO-derived OPEC series: STEO's
+        two most recent monthly aggregates are typically incomplete (they inflate
+        spare/disruption figures), so periods after this clean cutoff are treated
+        as forecast / excluded from headline snapshots.
+        """
+        intl_rows = await self._fetch_eia_series(
+            _ROUTE_INTERNATIONAL,
+            {
+                "countryRegionId": ["OPEC"],
+                "productId":       [_INTL_PRODUCT_CRUDE],
+                "activityId":      [_INTL_ACTIVITY_ID],
+            },
+            frequency="monthly", length=6,
+        )
+        return max((r.get("period", "") for r in intl_rows if r.get("period")), default="")
+
+    async def get_opec_overview(self) -> dict[str, Any]:
+        """OPEC+ overview from EIA STEO, anchored to EIA international.
+
+        Split-sources design: production *totals* come from /opec/production
+        (international). This endpoint supplies what international lacks — OPEC
+        spare/production capacity, the structural split (OPEC vs OPEC+ other vs
+        non-OPEC+ ex-US), and the world balance (STEO T3 net inventory
+        withdrawals). STEO values are already mb/d (NOT divided).
+
+        Actual/forecast boundary = international's latest OPEC month. STEO periods
+        at or before it are actuals; later periods are forecast (for the cone).
+        STEO's two most recent monthly aggregates are typically incomplete (OPEC
+        capacity appears to drop by ~10 mb/d), so anchoring to international keeps
+        them on the forecast side and out of the hero. Basis-independent (crude).
+        """
+        async def fetch() -> dict[str, Any]:
+            # 1) Cutoff = latest OPEC actual month from international (clean source).
+            cutoff = await self._opec_actual_cutoff()
+
+            # 2) STEO capacity / spare / structural split / balance.
+            steo_series = [
+                _STEO_CAPACITY, _STEO_SPARE, _STEO_BALANCE,
+                _STEO_SPLIT_OPEC, _STEO_SPLIT_OPEC_OTHER, _STEO_SPLIT_NON,
+            ]
+            rows = await self._fetch_eia_series(
+                _ROUTE_STEO,
+                {"seriesId": steo_series},
+                frequency="monthly", length=1600,
+            )
+
+            # Partition by seriesId → {period: value}.
+            by_series: dict[str, dict[str, float]] = {}
+            for row in rows:
+                sid    = row.get("seriesId", "")
+                period = row.get("period", "")
+                if not sid or not period:
+                    continue
+                try:
+                    by_series.setdefault(sid, {})[period] = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+
+            def _v(sid: str, period: str | None) -> float | None:
+                return by_series.get(sid, {}).get(period) if period else None
+
+            def _r(v: float | None) -> float | None:
+                return round(v, 3) if v is not None else None
+
+            def _is_forecast(period: str) -> bool:
+                return bool(cutoff) and period > cutoff
+
+            # Hero: latest actual capacity period (<= cutoff). With cutoff from
+            # international, STEO's broken trailing months are excluded.
+            cap_actual = sorted(
+                (p for p in by_series.get(_STEO_CAPACITY, {}) if not cutoff or p <= cutoff),
+                reverse=True,
+            )
+            latest = cap_actual[0] if cap_actual else None
+
+            capacity = _v(_STEO_CAPACITY, latest)
+            spare    = _v(_STEO_SPARE, latest)
+            opec_pr  = _v(_STEO_SPLIT_OPEC, latest)
+            t3       = _v(_STEO_BALANCE, latest)
+            # Implied supply−demand balance = −(net inventory withdrawals).
+            balance  = round(-t3, 3) if t3 is not None else None
+            util     = round(opec_pr / capacity * 100, 1) if (opec_pr and capacity) else None
+
+            hero = {
+                "last_actual_period":       latest,
+                "spare_capacity_mbd":       _r(spare),
+                "production_capacity_mbd":  _r(capacity),
+                "capacity_utilization_pct": util,
+                "market_balance_mbd":       balance,
+                "market_balance_label":     None if balance is None else ("surplus" if balance >= 0 else "deficit"),
+            }
+
+            # Histories (newest-first, most recent ~180 months incl. forecast).
+            all_periods = sorted({p for s in by_series.values() for p in s}, reverse=True)[:180]
+
+            capacity_history = [
+                {
+                    "period":      f"{p}-01",
+                    "is_forecast": _is_forecast(p),
+                    "production":  _r(_v(_STEO_SPLIT_OPEC, p)),
+                    "capacity":    _r(_v(_STEO_CAPACITY, p)),
+                    "spare":       _r(_v(_STEO_SPARE, p)),
+                }
+                for p in all_periods
+            ]
+            split_history = [
+                {
+                    "period":          f"{p}-01",
+                    "is_forecast":     _is_forecast(p),
+                    "opec":            _r(_v(_STEO_SPLIT_OPEC, p)),
+                    "opec_plus_other": _r(_v(_STEO_SPLIT_OPEC_OTHER, p)),
+                    "non_opec_plus":   _r(_v(_STEO_SPLIT_NON, p)),
+                }
+                for p in all_periods
+            ]
+            balance_history = [
+                {
+                    "period":          f"{p}-01",
+                    "is_forecast":     _is_forecast(p),
+                    "net_withdrawals": _r(_v(_STEO_BALANCE, p)),
+                    "implied_balance": (_r(-_v(_STEO_BALANCE, p)) if _v(_STEO_BALANCE, p) is not None else None),
+                }
+                for p in all_periods
+            ]
+
+            return {
+                "last_actual_period": latest,
+                "hero":               hero,
+                "capacity_history":   capacity_history,
+                "split_history":      split_history,
+                "balance_history":    balance_history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:opec_overview_v2", fetch, ttl=21600)
+
+    async def get_opec_disruptions(self) -> dict[str, Any]:
+        """OPEC+ unplanned production disruptions (barrels offline) — STEO PADI_*.
+
+        Values already mb/d. Returns a latest-month snapshot per country (+MoM)
+        and per-country history (newest-first, ~48 months) for a stacked area.
+        PADI series track current/near-term disruptions and are more timely than
+        the international production data.
+        """
+        async def fetch() -> dict[str, Any]:
+            # Anchor to international's latest clean OPEC month — STEO's broken
+            # trailing months inflate OPEC-member disruptions (Saudi 0.07 → 3.57).
+            cutoff = await self._opec_actual_cutoff()
+
+            rows = await self._fetch_eia_series(
+                _ROUTE_STEO,
+                {"seriesId": list(_STEO_PADI.keys())},
+                frequency="monthly", length=1200,
+            )
+
+            by_series: dict[str, dict[str, float]] = {}
+            for row in rows:
+                sid    = row.get("seriesId", "")
+                period = row.get("period", "")
+                if sid not in _STEO_PADI or not period:
+                    continue
+                try:
+                    by_series.setdefault(sid, {})[period] = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+
+            # Only periods at/before the clean cutoff.
+            all_periods = sorted(
+                {p for s in by_series.values() for p in s if not cutoff or p <= cutoff},
+                reverse=True,
+            )
+            latest = all_periods[0] if all_periods else None
+            prev   = all_periods[1] if len(all_periods) > 1 else None
+
+            countries: list[dict[str, Any]] = []
+            for code, name in _STEO_PADI.items():
+                series = by_series.get(code, {})
+                cur = series.get(latest) if latest else None
+                if cur is None:
+                    continue
+                prv = series.get(prev) if prev else None
+                countries.append({
+                    "code":       code,
+                    "name":       name,
+                    "latest_mbd": round(cur, 3),
+                    "mom":        round(cur - prv, 3) if prv is not None else None,
+                })
+            countries.sort(key=lambda c: c["latest_mbd"], reverse=True)
+            total = round(sum(c["latest_mbd"] for c in countries), 3) if countries else None
+
+            # Per-country history (newest-first, last 48 months). Drop countries
+            # with no disruption in the window to keep the stacked chart legible.
+            recent = all_periods[:48]
+            series_out: dict[str, list[dict[str, Any]]] = {}
+            for code, name in _STEO_PADI.items():
+                svals = by_series.get(code, {})
+                pts = [{"period": f"{p}-01", "value": round(svals[p], 3)} for p in recent if p in svals]
+                if any(pt["value"] > 0 for pt in pts):
+                    series_out[name] = pts
+
+            return {
+                "latest_period": latest,
+                "total_mbd":     total,
+                "countries":     countries,
+                "series":        series_out,
+            }
+
+        return await get_cache().cache_or_fetch("eia:opec_disruptions_v1", fetch, ttl=21600)
+
+    async def get_opec_compliance(self) -> dict[str, Any]:
+        """OPEC+ quota compliance — required (hand-curated JSON) vs actual production.
+
+        Actual is crude + lease condensate (international productId 57) at the
+        latest available month (lags ~4-5 months). Required levels are the current
+        OPEC+ targets. delta = actual − required; positive = over-producing.
+        Exempt members (Iran/Libya/Venezuela) are not in the quota file.
+        """
+        async def fetch() -> dict[str, Any]:
+            quotas = _load_opec_quotas()
+            required = quotas.get("required_mbd", {})
+
+            prod = await self.get_opec_production(basis="crude")
+            actual_by_iso = {r["iso3"]: r["latest_mbd"] for r in prod.get("table", [])}
+            actual_period = prod.get("hero", {}).get("latest_period")
+
+            rows: list[dict[str, Any]] = []
+            for iso, req in required.items():
+                actual = actual_by_iso.get(iso)
+                delta = round(actual - req, 3) if actual is not None else None
+                status = None
+                if delta is not None:
+                    status = "over" if delta > 0 else "under" if delta < 0 else "on"
+                rows.append({
+                    "iso3":         iso,
+                    "country":      OPEC_PLUS_PROD_MEMBERS.get(iso, iso),
+                    "required_mbd": round(req, 3),
+                    "actual_mbd":   round(actual, 3) if actual is not None else None,
+                    "delta_mbd":    delta,
+                    "status":       status,
+                })
+            # Biggest over-producers first; missing-actual rows sink to the bottom.
+            rows.sort(key=lambda r: r["delta_mbd"] if r["delta_mbd"] is not None else -1e9, reverse=True)
+
+            present = [r for r in rows if r["actual_mbd"] is not None]
+            total_req = round(sum(r["required_mbd"] for r in present), 3) if present else None
+            total_act = round(sum(r["actual_mbd"] for r in present), 3) if present else None
+            total_delta = (
+                round(total_act - total_req, 3)
+                if (total_req is not None and total_act is not None) else None
+            )
+
+            return {
+                "as_of":              quotas.get("as_of"),
+                "source":             quotas.get("source"),
+                "actual_period":      actual_period,
+                "total_required_mbd": total_req,
+                "total_actual_mbd":   total_act,
+                "total_delta_mbd":    total_delta,
+                "rows":               rows,
+            }
+
+        return await get_cache().cache_or_fetch("eia:opec_compliance_v1", fetch, ttl=21600)
+
+    async def _fetch_jodi_opec_crude(self) -> dict[str, float]:
+        """Sum the 5 JODI-reporting OPEC members' crude production per period.
+
+        JODI primary CSV cols: REF_AREA, TIME_PERIOD, ENERGY_PRODUCT,
+        FLOW_BREAKDOWN, UNIT_MEASURE, OBS_VALUE, ASSESSMENT_CODE. We keep
+        ENERGY_PRODUCT=CRUDEOIL, FLOW=INDPROD (indigenous production), UNIT=KBD,
+        then KBD → mb/d (/1000). Missing values are "-"/"x" → skipped.
+        """
+        by_period: dict[str, float] = {}
+        for url in _jodi_csv_urls():
+            try:
+                resp = await request_with_retry(
+                    "GET", url,
+                    timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                logger.warning("eia.cross_check: JODI fetch failed (%s): %s", url, exc)
+                continue
+            for line in resp.text.splitlines():
+                parts = line.split(",")
+                if len(parts) < 6:
+                    continue
+                area, period, product, flow, unit, value = parts[:6]
+                if product != "CRUDEOIL" or flow != "INDPROD" or unit != "KBD":
+                    continue
+                if area not in _JODI_OPEC:
+                    continue
+                try:
+                    by_period[period] = by_period.get(period, 0.0) + float(value) / 1000.0
+                except ValueError:
+                    continue
+        return by_period
+
+    async def get_opec_cross_check(self) -> dict[str, Any]:
+        """Cross-check OPEC crude production: EIA international vs JODI.
+
+        Compared on the SAME five OPEC members that report to JODI (Saudi,
+        Kuwait, Nigeria, Algeria, Venezuela) — apples to apples. Returns aligned
+        monthly series (newest-first) + the latest month where both report.
+        """
+        async def fetch() -> dict[str, Any]:
+            prod = await self.get_opec_production(basis="crude")
+            spark = prod.get("sparklines", {})
+
+            eia_by_period: dict[str, float] = {}
+            for iso3 in _JODI_OPEC.values():
+                for pt in spark.get(iso3, []):
+                    if pt.get("value") is None:
+                        continue
+                    key = pt["period"][:7]  # YYYY-MM
+                    eia_by_period[key] = eia_by_period.get(key, 0.0) + pt["value"]
+
+            jodi_by_period = await self._fetch_jodi_opec_crude()
+
+            keys = sorted(set(eia_by_period) | set(jodi_by_period), reverse=True)[:36]
+            history = [
+                {
+                    "period": f"{k}-01",
+                    "eia":    round(eia_by_period[k], 3) if k in eia_by_period else None,
+                    "jodi":   round(jodi_by_period[k], 3) if k in jodi_by_period else None,
+                }
+                for k in keys
+            ]
+
+            latest = next(
+                (h for h in history if h["eia"] is not None and h["jodi"] is not None), None
+            )
+            return {
+                "members":       [OPEC_PLUS_PROD_MEMBERS[i] for i in _JODI_OPEC.values()],
+                "latest_period": latest["period"] if latest else None,
+                "eia_latest":    latest["eia"] if latest else None,
+                "jodi_latest":   latest["jodi"] if latest else None,
+                "diff_latest":   round(latest["eia"] - latest["jodi"], 3) if latest else None,
+                "history":       history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:opec_cross_check_v1", fetch, ttl=86400)

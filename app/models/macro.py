@@ -19,3 +19,21 @@ class MacroResponse(BaseModel):
     last_updated: datetime = Field(
         default_factory=utc_now, description="UTC timestamp when this payload was assembled"
     )
+
+
+class Article(BaseModel):
+    title: str
+    link: str
+    published: str
+    summary: str | None = None
+
+
+class SourceBrief(BaseModel):
+    source: str
+    url: str
+    articles: list[Article]
+
+
+class MorningBriefResponse(BaseModel):
+    sources: list[SourceBrief]
+    generated_at: datetime

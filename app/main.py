@@ -30,6 +30,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler.start()
     logger.info("Scheduler started")
 
+    import asyncio as _asyncio
+    from app.scheduler.jobs import warmup_morning_brief
+    _asyncio.create_task(warmup_morning_brief())
+    logger.info("Morning brief warmup task created")
+
     ls_module.broadcaster = LightstreamerBroadcaster()
     ls_module.broadcaster.start()
 

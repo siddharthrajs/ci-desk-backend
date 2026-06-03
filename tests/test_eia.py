@@ -43,6 +43,11 @@ def _eia_response(data: list[dict[str, Any]], status: int = 200) -> httpx.Respon
     return httpx.Response(status, json=body, request=_DUMMY_REQUEST)
 
 
+def _csv_response(text: str, status: int = 200) -> httpx.Response:
+    """Plain-text (CSV) httpx response — for JODI bulk-file fetches."""
+    return httpx.Response(status, text=text, request=_DUMMY_REQUEST)
+
+
 def _make_service() -> tuple[EIAService, AsyncMock]:
     """Return (service, mock_get).
 
@@ -521,3 +526,469 @@ class TestEdgeCases:
         params = mock_get.call_args.kwargs.get("params", {})
         assert params.get("sort[0][column]") == "period"
         assert params.get("sort[0][direction]") == "desc"
+
+
+# =============================================================================
+# OPEC+ subtab — international route, crude/liquids basis toggle
+# =============================================================================
+
+def _intl_row(period: str, value: str, country: str = "SAU", product: str = "57") -> dict:
+    """One EIA international data row (production, TBPD)."""
+    return {
+        "period": period,
+        "countryRegionId": country,
+        "productId": product,
+        "activityId": "1",
+        "value": value,
+        "unit": "TBPD",
+    }
+
+
+class TestGetOpecProduction:
+    def _rows(self, product: str = "57") -> list[dict]:
+        rows = []
+        for country in ("SAU", "RUS", "IRQ"):
+            rows.append(_intl_row("2026-01", "10000", country, product))
+            rows.append(_intl_row("2025-12", "9900", country, product))
+        return rows
+
+    @pytest.mark.asyncio
+    async def test_default_basis_requests_crude_product_57(self, no_cache: MagicMock) -> None:
+        """Default basis is crude oil + lease condensate (productId 57), NOT 55."""
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        await service.get_opec_production()
+        params = mock_get.call_args.kwargs.get("params", {})
+        assert params.get("facets[productId][]") == ["57"]
+
+    @pytest.mark.asyncio
+    async def test_liquids_basis_requests_product_55(self, no_cache: MagicMock) -> None:
+        """basis='liquids' switches to total liquids incl. NGPL (productId 55)."""
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows("55"))
+        await service.get_opec_production(basis="liquids")
+        params = mock_get.call_args.kwargs.get("params", {})
+        assert params.get("facets[productId][]") == ["55"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_cache_keys_per_basis(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        await service.get_opec_production()
+        crude_key = no_cache.cache_or_fetch.call_args.args[0]
+        await service.get_opec_production(basis="liquids")
+        liquids_key = no_cache.cache_or_fetch.call_args.args[0]
+        assert crude_key != liquids_key
+
+    @pytest.mark.asyncio
+    async def test_hits_international_route(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        await service.get_opec_production()
+        url = mock_get.call_args.args[0]
+        assert "international" in url
+
+    @pytest.mark.asyncio
+    async def test_returns_table_values_in_mbd(self, no_cache: MagicMock) -> None:
+        """TBPD input is divided by 1000 to MBD in the country table."""
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        result = await service.get_opec_production()
+        sau = next(r for r in result["table"] if r["iso3"] == "SAU")
+        assert sau["latest_mbd"] == 10.0
+
+
+class TestGetOpecHistory:
+    def _rows(self, product: str = "57") -> list[dict]:
+        rows = []
+        for country in ("SAU", "RUS"):
+            rows.append(_intl_row("2026-01", "10000", country, product))
+            rows.append(_intl_row("2025-12", "9900", country, product))
+        return rows
+
+    @pytest.mark.asyncio
+    async def test_default_basis_requests_crude_product_57(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        await service.get_opec_history()
+        params = mock_get.call_args.kwargs.get("params", {})
+        assert params.get("facets[productId][]") == ["57"]
+
+    @pytest.mark.asyncio
+    async def test_liquids_basis_requests_product_55(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows("55"))
+        await service.get_opec_history(basis="liquids")
+        params = mock_get.call_args.kwargs.get("params", {})
+        assert params.get("facets[productId][]") == ["55"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_cache_keys_per_basis(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._rows())
+        await service.get_opec_history()
+        crude_key = no_cache.cache_or_fetch.call_args.args[0]
+        await service.get_opec_history(basis="liquids")
+        liquids_key = no_cache.cache_or_fetch.call_args.args[0]
+        assert crude_key != liquids_key
+
+
+# =============================================================================
+# OPEC+ overview — STEO route (spare/production capacity, splits, balance)
+# =============================================================================
+
+def _steo_row(period: str, value: str, series: str) -> dict:
+    """One EIA STEO data row. STEO values are already mb/d (NOT divided)."""
+    return {
+        "period": period,
+        "seriesId": series,
+        "seriesDescription": series,
+        "value": value,
+        "unit": "million barrels per day",
+    }
+
+
+class TestGetOpecOverview:
+    """Split-sources overview: actual/forecast boundary comes from EIA
+    international (the clean production source); STEO supplies spare/production
+    capacity, structural splits and the world balance. STEO's broken trailing
+    months (capacity that drops impossibly) fall after the cutoff → forecast,
+    so the hero never shows them. Overview is basis-independent (crude STEO)."""
+
+    # international OPEC aggregate — latest actual month is 2026-02 (the cutoff).
+    def _intl_rows(self) -> list[dict]:
+        return [
+            _intl_row("2026-02", "30680", "OPEC", "57"),
+            _intl_row("2026-01", "30790", "OPEC", "57"),
+        ]
+
+    # STEO: clean through 2026-02; 2026-03/04 are broken (capacity halves);
+    # 2027-12 is model forecast.
+    def _steo_rows(self) -> list[dict]:
+        return [
+            # COPC_OPEC — capacity
+            _steo_row("2027-12", "26.955", "COPC_OPEC"),
+            _steo_row("2026-04", "16.94",  "COPC_OPEC"),   # broken
+            _steo_row("2026-02", "28.13",  "COPC_OPEC"),   # clean (== cutoff)
+            _steo_row("2026-01", "28.06",  "COPC_OPEC"),
+            # COPS_OPEC — spare
+            _steo_row("2027-12", "2.58",  "COPS_OPEC"),
+            _steo_row("2026-04", "0.02",  "COPS_OPEC"),    # broken
+            _steo_row("2026-02", "2.22",  "COPS_OPEC"),    # clean
+            # COPR_OPEC — production (for util + split)
+            _steo_row("2026-02", "25.91", "COPR_OPEC"),
+            # splits
+            _steo_row("2026-02", "14.30", "COPR_OPECPLUS_OTHER"),
+            _steo_row("2026-02", "20.10", "COPR_NONOPECPLUS_XUS"),
+            # T3 — net inventory withdrawals (negative = build = surplus)
+            _steo_row("2027-12", "-3.77", "T3_STCHANGE_WORLD"),
+            _steo_row("2026-02", "-1.00", "T3_STCHANGE_WORLD"),
+        ]
+
+    def _wire(self, mock_get: AsyncMock) -> None:
+        """international call first, STEO second."""
+        mock_get.side_effect = [
+            _eia_response(self._intl_rows()),
+            _eia_response(self._steo_rows()),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_hits_steo_route(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_overview()
+        urls = [c.args[0] for c in mock_get.call_args_list]
+        assert any("steo" in u for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_requests_capacity_spare_and_balance_series(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_overview()
+        steo_call = next(c for c in mock_get.call_args_list if "steo" in c.args[0])
+        series = steo_call.kwargs.get("params", {}).get("facets[seriesId][]", [])
+        assert {"COPC_OPEC", "COPS_OPEC", "T3_STCHANGE_WORLD"} <= set(series)
+
+    @pytest.mark.asyncio
+    async def test_steo_values_not_divided(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_overview()
+        assert result["hero"]["production_capacity_mbd"] == 28.13
+
+    @pytest.mark.asyncio
+    async def test_hero_anchored_to_intl_cutoff_skips_broken_tail(self, no_cache: MagicMock) -> None:
+        """Hero uses 2026-02 (international cutoff), NOT STEO's broken 2026-04."""
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_overview()
+        assert result["hero"]["last_actual_period"] == "2026-02"
+        assert result["hero"]["spare_capacity_mbd"] == 2.22   # clean, not 0.02
+
+    @pytest.mark.asyncio
+    async def test_history_forecast_boundary_is_intl_cutoff(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_overview()
+        by_period = {p["period"]: p for p in result["capacity_history"]}
+        assert by_period["2026-02-01"]["is_forecast"] is False
+        assert by_period["2026-04-01"]["is_forecast"] is True   # broken month → forecast side
+        assert by_period["2027-12-01"]["is_forecast"] is True
+
+    @pytest.mark.asyncio
+    async def test_market_balance_from_t3_surplus(self, no_cache: MagicMock) -> None:
+        """T3 net withdrawals −1.0 (a build) → +1.0 surplus."""
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_overview()
+        assert result["hero"]["market_balance_mbd"] == pytest.approx(1.0, abs=0.001)
+        assert result["hero"]["market_balance_label"] == "surplus"
+
+    @pytest.mark.asyncio
+    async def test_split_history_present(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_overview()
+        feb = next(p for p in result["split_history"] if p["period"] == "2026-02-01")
+        assert feb["opec_plus_other"] == 14.30
+        assert feb["non_opec_plus"] == 20.10
+
+    @pytest.mark.asyncio
+    async def test_cache_key(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_overview()
+        assert no_cache.cache_or_fetch.call_args.args[0] == "eia:opec_overview_v2"
+
+
+# =============================================================================
+# OPEC+ disruptions — STEO PADI_* (barrels offline by country)
+# =============================================================================
+
+class TestGetOpecDisruptions:
+    """Anchored to international's latest OPEC month (2026-01 here) so STEO's
+    broken trailing months — which inflate OPEC-member 'disruptions' (Saudi
+    jumps 0.07→3.57) — are excluded from the snapshot."""
+
+    def _intl_rows(self) -> list[dict]:
+        return [
+            _intl_row("2026-01", "30790", "OPEC", "57"),
+            _intl_row("2025-12", "30680", "OPEC", "57"),
+        ]
+
+    def _steo_rows(self) -> list[dict]:
+        return [
+            # Saudi: broken 2026-04 spike vs clean 2026-01/2025-12
+            _steo_row("2026-04", "3.57", "PADI_SA"),
+            _steo_row("2026-01", "0.07", "PADI_SA"),
+            _steo_row("2025-12", "0.06", "PADI_SA"),
+            # Russia (non-OPEC, genuine outages)
+            _steo_row("2026-04", "1.10", "PADI_RS"),
+            _steo_row("2026-01", "0.85", "PADI_RS"),
+            _steo_row("2025-12", "0.80", "PADI_RS"),
+            # Nigeria
+            _steo_row("2026-01", "0.20", "PADI_NI"),
+            _steo_row("2025-12", "0.20", "PADI_NI"),
+        ]
+
+    def _wire(self, mock_get: AsyncMock) -> None:
+        mock_get.side_effect = [
+            _eia_response(self._intl_rows()),   # cutoff lookup
+            _eia_response(self._steo_rows()),   # PADI
+        ]
+
+    @pytest.mark.asyncio
+    async def test_hits_steo_route(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_disruptions()
+        assert any("steo" in c.args[0] for c in mock_get.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_requests_padi_series(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_disruptions()
+        steo_call = next(c for c in mock_get.call_args_list if "steo" in c.args[0])
+        series = steo_call.kwargs.get("params", {}).get("facets[seriesId][]", [])
+        assert "PADI_RS" in series
+
+    @pytest.mark.asyncio
+    async def test_snapshot_anchored_skips_broken_month(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_disruptions()
+        assert result["latest_period"] == "2026-01"
+        saudi = next(c for c in result["countries"] if c["name"] == "Saudi Arabia")
+        assert saudi["latest_mbd"] == 0.07   # clean, not the 3.57 broken spike
+
+    @pytest.mark.asyncio
+    async def test_total_is_sum_at_cutoff(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_disruptions()
+        # 2026-01: Russia 0.85 + Nigeria 0.20 + Saudi 0.07 = 1.12
+        assert result["total_mbd"] == pytest.approx(1.12, abs=0.001)
+
+    @pytest.mark.asyncio
+    async def test_countries_sorted_desc(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_disruptions()
+        assert result["countries"][0]["name"] == "Russia"
+        assert result["countries"][0]["mom"] == pytest.approx(0.05, abs=0.001)  # 0.85 − 0.80
+
+    @pytest.mark.asyncio
+    async def test_history_per_country_newest_first(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        result = await service.get_opec_disruptions()
+        rus = result["series"]["Russia"]
+        assert rus[0]["period"] == "2026-01-01"   # broken 2026-04 excluded
+        assert rus[0]["value"] == 0.85
+
+    @pytest.mark.asyncio
+    async def test_cache_key(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        await service.get_opec_disruptions()
+        assert no_cache.cache_or_fetch.call_args.args[0] == "eia:opec_disruptions_v1"
+
+
+# =============================================================================
+# OPEC+ compliance — quota JSON joined with international actuals
+# =============================================================================
+
+class TestGetOpecCompliance:
+    QUOTAS = {
+        "as_of": "2026-06",
+        "source": "test",
+        "required_mbd": {"SAU": 10.0, "RUS": 9.5, "IRQ": 4.0},
+    }
+
+    def _intl_rows(self) -> list[dict]:
+        # actual crude (TBPD → /1000): SAU 10.5, RUS 9.3, IRQ 4.2
+        return [
+            _intl_row("2026-01", "10500", "SAU", "57"),
+            _intl_row("2025-12", "10400", "SAU", "57"),
+            _intl_row("2026-01", "9300", "RUS", "57"),
+            _intl_row("2026-01", "4200", "IRQ", "57"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_joins_actual_with_quota(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._intl_rows())
+        with patch("app.services.eia._load_opec_quotas", return_value=self.QUOTAS):
+            result = await service.get_opec_compliance()
+        sau = next(r for r in result["rows"] if r["iso3"] == "SAU")
+        assert sau["required_mbd"] == 10.0
+        assert sau["actual_mbd"] == 10.5
+        assert sau["delta_mbd"] == pytest.approx(0.5, abs=0.001)
+
+    @pytest.mark.asyncio
+    async def test_over_under_status(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._intl_rows())
+        with patch("app.services.eia._load_opec_quotas", return_value=self.QUOTAS):
+            result = await service.get_opec_compliance()
+        by_iso = {r["iso3"]: r for r in result["rows"]}
+        assert by_iso["SAU"]["status"] == "over"   # 10.5 > 10.0
+        assert by_iso["RUS"]["status"] == "under"  # 9.3 < 9.5
+
+    @pytest.mark.asyncio
+    async def test_group_totals(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._intl_rows())
+        with patch("app.services.eia._load_opec_quotas", return_value=self.QUOTAS):
+            result = await service.get_opec_compliance()
+        assert result["total_required_mbd"] == pytest.approx(23.5, abs=0.001)
+        assert result["total_actual_mbd"] == pytest.approx(24.0, abs=0.001)
+        assert result["total_delta_mbd"] == pytest.approx(0.5, abs=0.001)
+
+    @pytest.mark.asyncio
+    async def test_carries_quota_metadata(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._intl_rows())
+        with patch("app.services.eia._load_opec_quotas", return_value=self.QUOTAS):
+            result = await service.get_opec_compliance()
+        assert result["as_of"] == "2026-06"
+        assert result["actual_period"] == "2026-01"
+
+    @pytest.mark.asyncio
+    async def test_cache_key(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        mock_get.return_value = _eia_response(self._intl_rows())
+        with patch("app.services.eia._load_opec_quotas", return_value=self.QUOTAS):
+            await service.get_opec_compliance()
+        # compliance is the outer cache; it nests the production fetch inside.
+        keys = [c.args[0] for c in no_cache.cache_or_fetch.call_args_list]
+        assert keys[0] == "eia:opec_compliance_v1"
+
+
+# =============================================================================
+# OPEC+ cross-check — EIA international vs JODI, same 5 reporting members
+# =============================================================================
+
+class TestGetOpecCrossCheck:
+    # EIA international (productId 57, ISO-3, TBPD) for the 5 JODI-reporting members.
+    def _intl_rows(self) -> list[dict]:
+        vals = {"SAU": "10000", "KWT": "2600", "NGA": "1400", "DZA": "980", "VEN": "1100"}
+        return [_intl_row("2025-12", v, iso, "57") for iso, v in vals.items()]
+
+    # JODI annual CSV (ISO-2, KBD). Includes rows that must be ignored.
+    JODI_CSV = (
+        "REF_AREA,TIME_PERIOD,ENERGY_PRODUCT,FLOW_BREAKDOWN,UNIT_MEASURE,OBS_VALUE,ASSESSMENT_CODE\n"
+        "SA,2025-12,CRUDEOIL,INDPROD,KBD,10100.0000,1\n"
+        "KW,2025-12,CRUDEOIL,INDPROD,KBD,2580.0000,1\n"
+        "NG,2025-12,CRUDEOIL,INDPROD,KBD,1420.0000,1\n"
+        "DZ,2025-12,CRUDEOIL,INDPROD,KBD,970.0000,1\n"
+        "VE,2025-12,CRUDEOIL,INDPROD,KBD,1120.0000,1\n"
+        "IQ,2025-12,CRUDEOIL,INDPROD,KBD,-,3\n"            # non-reporter / missing → skip
+        "SA,2025-12,CRUDEOIL,CLOSTLV,KBD,5000.0000,3\n"    # wrong flow → skip
+        "SA,2025-12,CRUDEOIL,INDPROD,CONVBBL,300000,1\n"   # wrong unit → skip
+    )
+
+    def _wire(self, mock_get: AsyncMock) -> None:
+        # 1) international (via get_opec_production)  2) JODI CSV (one patched URL)
+        mock_get.side_effect = [_eia_response(self._intl_rows()), _csv_response(self.JODI_CSV)]
+
+    @pytest.mark.asyncio
+    async def test_fetches_jodi_and_international(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        with patch("app.services.eia._jodi_csv_urls", return_value=["http://test/jodi.csv"]):
+            await service.get_opec_cross_check()
+        urls = [c.args[0] for c in mock_get.call_args_list]
+        assert any("jodi" in u for u in urls)
+        assert any("international" in u for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_history_aligns_both_sources(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        with patch("app.services.eia._jodi_csv_urls", return_value=["http://test/jodi.csv"]):
+            result = await service.get_opec_cross_check()
+        dec = next(h for h in result["history"] if h["period"] == "2025-12-01")
+        # EIA: 10.0+2.6+1.4+0.98+1.1 = 16.08
+        assert dec["eia"] == pytest.approx(16.08, abs=0.001)
+        # JODI: 10.1+2.58+1.42+0.97+1.12 = 16.19 (other rows ignored)
+        assert dec["jodi"] == pytest.approx(16.19, abs=0.001)
+
+    @pytest.mark.asyncio
+    async def test_latest_diff(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        with patch("app.services.eia._jodi_csv_urls", return_value=["http://test/jodi.csv"]):
+            result = await service.get_opec_cross_check()
+        assert result["latest_period"] == "2025-12-01"
+        assert result["diff_latest"] == pytest.approx(-0.11, abs=0.001)  # eia − jodi
+
+    @pytest.mark.asyncio
+    async def test_cache_key(self, no_cache: MagicMock) -> None:
+        service, mock_get = _make_service()
+        self._wire(mock_get)
+        with patch("app.services.eia._jodi_csv_urls", return_value=["http://test/jodi.csv"]):
+            await service.get_opec_cross_check()
+        keys = [c.args[0] for c in no_cache.cache_or_fetch.call_args_list]
+        assert keys[0] == "eia:opec_cross_check_v1"

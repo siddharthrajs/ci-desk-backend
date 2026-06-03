@@ -237,3 +237,114 @@ class OpecHistoryResponse(BaseModel):
     last_updated:      datetime = Field(default_factory=utc_now)
     members:           dict[str, list[OpecSparkPoint]] = Field(default_factory=dict)
     periods_available: int = 0
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/overview  (EIA STEO, anchored to international — capacity,
+# spare, structural split, world balance). All values mb/d. Crude basis.
+# Histories include STEO's forward forecast (is_forecast); the actual/forecast
+# boundary is international's latest OPEC month.
+# ---------------------------------------------------------------------------
+
+class OpecOverviewHero(BaseModel):
+    last_actual_period:       str | None   = Field(None, description="Actual/forecast cutoff, YYYY-MM (from international)")
+    spare_capacity_mbd:       float | None = Field(None, description="OPEC spare crude capacity")
+    production_capacity_mbd:  float | None = Field(None, description="OPEC crude production capacity")
+    capacity_utilization_pct: float | None = Field(None, description="OPEC production ÷ capacity")
+    market_balance_mbd:       float | None = Field(None, description="Implied supply−demand (+surplus/−deficit)")
+    market_balance_label:     str | None   = None
+
+
+class OpecCapacityPoint(BaseModel):
+    period:      str  = Field(..., description="YYYY-MM-01")
+    is_forecast: bool = False
+    production:  float | None = Field(None, description="OPEC crude production (STEO)")
+    capacity:    float | None = Field(None, description="OPEC crude production capacity")
+    spare:       float | None = Field(None, description="OPEC spare crude capacity")
+
+
+class OpecSplitPoint(BaseModel):
+    period:          str  = Field(..., description="YYYY-MM-01")
+    is_forecast:     bool = False
+    opec:            float | None = None
+    opec_plus_other: float | None = None
+    non_opec_plus:   float | None = None
+
+
+class OpecBalancePoint(BaseModel):
+    period:          str  = Field(..., description="YYYY-MM-01")
+    is_forecast:     bool = False
+    net_withdrawals: float | None = Field(None, description="World net inventory withdrawals (mb/d; <0 = build)")
+    implied_balance: float | None = Field(None, description="Implied supply−demand = −net_withdrawals")
+
+
+class OpecOverviewResponse(BaseModel):
+    last_updated:       datetime = Field(default_factory=utc_now)
+    last_actual_period: str | None = None
+    hero:               OpecOverviewHero        = Field(default_factory=OpecOverviewHero)
+    capacity_history:   list[OpecCapacityPoint] = Field(default_factory=list)
+    split_history:      list[OpecSplitPoint]    = Field(default_factory=list)
+    balance_history:    list[OpecBalancePoint]  = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/disruptions  (EIA STEO PADI_* — barrels offline, mb/d)
+# ---------------------------------------------------------------------------
+
+class OpecDisruptionCountry(BaseModel):
+    code:       str
+    name:       str
+    latest_mbd: float
+    mom:        float | None = None
+
+
+class OpecDisruptionsResponse(BaseModel):
+    last_updated:  datetime = Field(default_factory=utc_now)
+    latest_period: str | None = None
+    total_mbd:     float | None = None
+    countries:     list[OpecDisruptionCountry]      = Field(default_factory=list)
+    series:        dict[str, list[OpecSparkPoint]]  = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/compliance  (quota JSON × international actuals, mb/d crude)
+# ---------------------------------------------------------------------------
+
+class OpecComplianceRow(BaseModel):
+    iso3:         str
+    country:      str
+    required_mbd: float
+    actual_mbd:   float | None = None
+    delta_mbd:    float | None = Field(None, description="actual − required; + = over-producing")
+    status:       str | None   = Field(None, description="over | under | on")
+
+
+class OpecComplianceResponse(BaseModel):
+    last_updated:       datetime = Field(default_factory=utc_now)
+    as_of:              str | None = Field(None, description="Quota effective month (YYYY-MM)")
+    source:             str | None = None
+    actual_period:      str | None = Field(None, description="Latest actual production month")
+    total_required_mbd: float | None = None
+    total_actual_mbd:   float | None = None
+    total_delta_mbd:    float | None = None
+    rows:               list[OpecComplianceRow] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/cross-check  (EIA international vs JODI — 5 reporting members)
+# ---------------------------------------------------------------------------
+
+class OpecCrossCheckPoint(BaseModel):
+    period: str  = Field(..., description="YYYY-MM-01")
+    eia:    float | None = None
+    jodi:   float | None = None
+
+
+class OpecCrossCheckResponse(BaseModel):
+    last_updated:  datetime = Field(default_factory=utc_now)
+    members:       list[str] = Field(default_factory=list, description="Members compared (both sources)")
+    latest_period: str | None = None
+    eia_latest:    float | None = None
+    jodi_latest:   float | None = None
+    diff_latest:   float | None = Field(None, description="EIA − JODI at latest common month")
+    history:       list[OpecCrossCheckPoint] = Field(default_factory=list)

@@ -42,4 +42,14 @@ def register_jobs() -> None:
     else:
         logger.warning("FINNHUB_API_KEY not set — Finnhub refresh jobs skipped")
 
+    from app.scheduler.jobs import refresh_morning_brief
+
+    scheduler.add_job(
+        refresh_morning_brief,
+        CronTrigger(hour=8, minute=0, timezone="Asia/Kolkata"),
+        id="morning_brief",
+        replace_existing=True,
+    )
+    logger.info("Morning brief job registered (daily 08:00 IST)")
+
     logger.info("Scheduler jobs registered")

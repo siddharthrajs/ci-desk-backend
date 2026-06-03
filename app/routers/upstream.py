@@ -8,7 +8,9 @@ later.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query
 
 from app.core.deps import get_eia_service
 from app.core.upstream import call_upstream
@@ -20,9 +22,13 @@ from app.models.upstream import (
     ImportsFeed,
     ImportsHistoryPoint,
     NaturalGasResponse,
+    OpecComplianceResponse,
+    OpecCrossCheckResponse,
+    OpecDisruptionsResponse,
     OpecHistoryResponse,
     OpecHero,
     OpecMemberRow,
+    OpecOverviewResponse,
     OpecProductionResponse,
     OpecSparkPoint,
     ProductionByRegionResponse,
@@ -175,13 +181,17 @@ async def get_us_reserves(
 @router.get(
     "/opec/production",
     response_model=OpecProductionResponse,
-    summary="OPEC+ crude production — hero KPIs, country table, 36M sparklines (monthly)",
+    summary="OPEC+ production — hero KPIs, country table, 36M sparklines (monthly)",
     responses={502: {"description": "EIA unavailable"}},
 )
 async def get_opec_production(
+    basis: Literal["crude", "liquids"] = Query(
+        "crude",
+        description="crude = crude+condensate (productId 57); liquids = total liquids (productId 55)",
+    ),
     eia: EIAService = Depends(get_eia_service),
 ) -> OpecProductionResponse:
-    data = await call_upstream("EIA", eia.get_opec_production)
+    data = await call_upstream("EIA", lambda: eia.get_opec_production(basis=basis))
     return OpecProductionResponse(
         hero=OpecHero(**data.get("hero", {})),
         table=[OpecMemberRow(**row) for row in data.get("table", [])],
@@ -199,13 +209,17 @@ async def get_opec_production(
 @router.get(
     "/opec/history",
     response_model=OpecHistoryResponse,
-    summary="OPEC+ crude production history — all members, 10Y monthly for stacked area",
+    summary="OPEC+ production history — all members, 10Y monthly for stacked area",
     responses={502: {"description": "EIA unavailable"}},
 )
 async def get_opec_history(
+    basis: Literal["crude", "liquids"] = Query(
+        "crude",
+        description="crude = crude+condensate (productId 57); liquids = total liquids (productId 55)",
+    ),
     eia: EIAService = Depends(get_eia_service),
 ) -> OpecHistoryResponse:
-    data = await call_upstream("EIA", eia.get_opec_history)
+    data = await call_upstream("EIA", lambda: eia.get_opec_history(basis=basis))
     return OpecHistoryResponse(
         members={
             iso3: [OpecSparkPoint(**pt) for pt in pts]
@@ -213,3 +227,71 @@ async def get_opec_history(
         },
         periods_available=data.get("periods_available", 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/overview
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/overview",
+    response_model=OpecOverviewResponse,
+    summary="OPEC+ overview (EIA STEO) — spare/production capacity, structural split, world balance, forecast",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_overview(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecOverviewResponse:
+    data = await call_upstream("EIA", eia.get_opec_overview)
+    return OpecOverviewResponse.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/disruptions
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/disruptions",
+    response_model=OpecDisruptionsResponse,
+    summary="OPEC+ unplanned production disruptions (EIA STEO PADI_*) — barrels offline by country",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_disruptions(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecDisruptionsResponse:
+    data = await call_upstream("EIA", eia.get_opec_disruptions)
+    return OpecDisruptionsResponse.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/compliance
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/compliance",
+    response_model=OpecComplianceResponse,
+    summary="OPEC+ quota compliance — required (curated) vs actual crude production",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_compliance(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecComplianceResponse:
+    data = await call_upstream("EIA", eia.get_opec_compliance)
+    return OpecComplianceResponse.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# /upstream/opec/cross-check
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/opec/cross-check",
+    response_model=OpecCrossCheckResponse,
+    summary="OPEC crude production cross-check — EIA international vs JODI (5 reporting members)",
+    responses={502: {"description": "EIA unavailable"}},
+)
+async def get_opec_cross_check(
+    eia: EIAService = Depends(get_eia_service),
+) -> OpecCrossCheckResponse:
+    data = await call_upstream("EIA", eia.get_opec_cross_check)
+    return OpecCrossCheckResponse.model_validate(data)

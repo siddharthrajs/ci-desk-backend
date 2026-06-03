@@ -1,0 +1,14 @@
+{
+  "as_of": "2026-06",
+  "source": "OPEC+ Declaration of Cooperation — decision of 3 May 2026 (required production effective June 2026)",
+  "note": "Required CRUDE production (mb/d) for the OPEC+ voluntary-adjustment group. Iran, Libya and Venezuela are exempt from quotas. UAE withdrew from OPEC/OPEC+ effective 1 May 2026. Hand-maintained — update after each monthly OPEC+ meeting (opec.org press releases).",
+  "required_mbd": {
+    "SAU": 10.291,
+    "RUS": 9.762,
+    "IRQ": 4.352,
+    "KWT": 2.628,
+    "KAZ": 1.599,
+    "DZA": 0.989,
+    "OMN": 0.826
+  }
+}

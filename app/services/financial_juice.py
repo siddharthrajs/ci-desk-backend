@@ -14,7 +14,7 @@ from app.core.cache import get_cache
 
 logger = logging.getLogger(__name__)
 
-RSS_URL = "https://www.financialjuice.com/rss"
+RSS_URL = "https://www.financialjuice.com/feed.ashx?xy=rss"
 
 _24H = timedelta(hours=24)
 _RSS_TTL = 300  # 5 minutes
