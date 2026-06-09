@@ -41,6 +41,10 @@ _ROUTE_NG_PRODUCTION      = "natural-gas/prod/sum" # NG gross withdrawals + dry
 _ROUTE_CRUDE_RESERVES     = "petroleum/crd/pres"   # crude proved reserves (annual)
 _ROUTE_NG_RESERVES        = "natural-gas/enr/dry"  # dry NG proved reserves (annual)
 
+# Midstream
+_ROUTE_CRUDE_EXPCP        = "petroleum/move/expcp"  # monthly crude exports by PADD
+_ROUTE_PADD_PIPE          = "petroleum/move/pipe"   # inter-PADD crude pipeline movements
+
 # Upstream — OPEC+ subtab
 _ROUTE_INTERNATIONAL      = "international"         # country-level production (monthly)
 _ROUTE_STEO               = "steo"                 # Short-Term Energy Outlook (monthly + 18M forecast)
@@ -94,10 +98,65 @@ DISTILLATE_STOCKS: dict[str, list[str]] = {
 
 # U.S. Strategic Petroleum Reserve crude oil level.
 # SPR drawdowns add short-term supply; fills remove it.
+# Process SAS = "Ending Stocks SPR" (distinct from SAX = "Ending Stocks Excluding SPR").
 SPR_LEVEL: dict[str, list[str]] = {
-    "product":  ["EPCO"],
+    "product":  ["EPC0"],
     "duoarea":  ["NUS"],
-    "process":  ["SAX"],
+    "process":  ["SAS"],
+}
+
+# Jet fuel (kerosene-type) ending stocks — same route as crude/gasoline/distillate.
+# Uses process SAE (ending stocks, petroleum products).
+JET_FUEL_STOCKS: dict[str, list[str]] = {
+    "product": ["EPJK"],
+    "duoarea": ["NUS"],
+    "process": ["SAE"],
+}
+
+# =============================================================================
+# Midstream constants
+# =============================================================================
+
+# Weekly crude exports: lives on the weekly supply route (sndw) with process EEX.
+# duoarea NUS-Z00 = U.S. total exports to all foreign destinations.
+# Units: MBBL/D (same as weekly production series on this route).
+CRUDE_EXPORTS_WEEKLY: dict[str, list[str]] = {
+    "product":  ["EPC0"],
+    "duoarea":  ["NUS-Z00"],
+    "process":  ["EEX"],
+}
+
+# Monthly crude exports by PADD of origin (petroleum/move/expcp).
+# duoarea format: "R1x-Z00" = PADD x exports to foreign destinations.
+# Units: MBBL (monthly total — no per-day variant on this route).
+CRUDE_EXPORTS_PADD_AREAS: list[str] = [
+    "R10-Z00",  # PADD 1 (East Coast)
+    "R20-Z00",  # PADD 2 (Midwest)
+    "R30-Z00",  # PADD 3 (Gulf Coast)
+    "R40-Z00",  # PADD 4 (Rocky Mountain)
+    "R50-Z00",  # PADD 5 (West Coast)
+]
+
+# Inter-PADD crude pipeline movements (petroleum/move/pipe, process LMV).
+# duoarea format: "DEST-SRC" → e.g., "R20-R30" = PADD 2 receipts FROM PADD 3.
+# All 13 directional pairs that EIA publishes for crude oil.
+PADD_PIPE_PAIRS: list[str] = [
+    "R10-R20", "R10-R30",
+    "R20-R10", "R20-R30", "R20-R40",
+    "R30-R10", "R30-R20", "R30-R40", "R30-R50",
+    "R40-R20", "R40-R30",
+    "R50-R30", "R50-R40",
+]
+PADD_SHORT: dict[str, str] = {
+    "R10": "padd1", "R20": "padd2", "R30": "padd3",
+    "R40": "padd4", "R50": "padd5",
+}
+PADD_LABELS: dict[str, str] = {
+    "R10": "PADD 1 East Coast",
+    "R20": "PADD 2 Midwest",
+    "R30": "PADD 3 Gulf Coast",
+    "R40": "PADD 4 Rocky Mtn",
+    "R50": "PADD 5 West Coast",
 }
 
 # ---------------------------------------------------------------------------
@@ -1677,3 +1736,264 @@ class EIAService:
             }
 
         return await get_cache().cache_or_fetch("eia:opec_cross_check_v1", fetch, ttl=86400)
+
+    # =========================================================================
+    # Midstream sub-endpoints
+    # =========================================================================
+
+    async def get_midstream_stocks(self) -> dict[str, Any]:
+        """Weekly US commercial petroleum stocks — crude, Cushing, gasoline, distillate,
+        jet fuel, SPR — with 2Y history, latest values, WoW changes, and days-of-supply.
+
+        Units: all stock values in Thousand Barrels (KBBL) as published by EIA.
+        Days-of-supply = latest stocks (KBBL) / latest 4-week-avg demand (kbpd).
+        """
+        _HISTORY = 104  # 2 years of weekly data
+
+        async def fetch() -> dict[str, Any]:
+            results = await asyncio.gather(
+                self._fetch_eia_series(_ROUTE_STOCKS, CRUDE_STOCKS,     length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_STOCKS, CUSHING_STOCKS,   length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_STOCKS, GASOLINE_STOCKS,  length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_STOCKS, DISTILLATE_STOCKS,length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_STOCKS, JET_FUEL_STOCKS,  length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_STOCKS, SPR_LEVEL,        length=_HISTORY),
+                self._fetch_eia_series(_ROUTE_PRODUCT_SUPPLIED, PRODUCT_SUPPLIED),
+                return_exceptions=True,
+            )
+
+            labels = ["crude", "cushing", "gasoline", "distillate", "jet", "spr", "demand"]
+            parsed: dict[str, Any] = {}
+            for label, result in zip(labels, results):
+                if isinstance(result, Exception):
+                    logger.warning("midstream.stocks: %s failed: %s", label, result)
+                    parsed[label] = []
+                else:
+                    parsed[label] = self._parse_series(result)  # type: ignore[arg-type]
+
+            demand = parsed["demand"]  # product_supplied returns all products mixed
+            # _parse_series strips the product key; demand rows already parsed by _parse_grouped
+            # but here we used the generic PRODUCT_SUPPLIED facet — get product-level demand
+            # properly via re-parsing the raw rows with grouping
+            gasoline_demand_rows = await asyncio.gather(
+                self._fetch_eia_series(_ROUTE_PRODUCT_SUPPLIED, {"product": ["EPM0F"], "duoarea": ["NUS"], "process": ["VPP"]}),
+                self._fetch_eia_series(_ROUTE_PRODUCT_SUPPLIED, {"product": ["EPD0"],  "duoarea": ["NUS"], "process": ["VPP"]}),
+                self._fetch_eia_series(_ROUTE_PRODUCT_SUPPLIED, {"product": ["EPJK"],  "duoarea": ["NUS"], "process": ["VPP"]}),
+                return_exceptions=True,
+            )
+            gas_demand  = self._parse_series(gasoline_demand_rows[0]) if not isinstance(gasoline_demand_rows[0], Exception) else []
+            dist_demand = self._parse_series(gasoline_demand_rows[1]) if not isinstance(gasoline_demand_rows[1], Exception) else []
+            jet_demand  = self._parse_series(gasoline_demand_rows[2]) if not isinstance(gasoline_demand_rows[2], Exception) else []
+
+            def _series(rows: list[dict[str, Any]]) -> dict[str, Any]:
+                if not rows:
+                    return {"latest_kbbl": None, "wow_kbbl": None, "history": []}
+                latest = rows[0]
+                return {
+                    "latest_kbbl": latest["value"],
+                    "wow_kbbl":    latest.get("wow_change"),
+                    "history":     [{"period": r["period"], "value": r["value"]} for r in rows],
+                }
+
+            def _dos(stocks: list[dict[str, Any]], demand_rows: list[dict[str, Any]]) -> float | None:
+                s = stocks[0]["value"]  if stocks  else None
+                d = demand_rows[0]["value"] if demand_rows else None
+                if s is None or not d:
+                    return None
+                return round(s / d, 1)
+
+            return {
+                "crude":        _series(parsed["crude"]),
+                "cushing":      _series(parsed["cushing"]),
+                "gasoline":     _series(parsed["gasoline"]),
+                "distillate":   _series(parsed["distillate"]),
+                "jet":          _series(parsed["jet"]),
+                "spr":          _series(parsed["spr"]),
+                "dos_gasoline":  _dos(parsed["gasoline"],  gas_demand),
+                "dos_distillate":_dos(parsed["distillate"], dist_demand),
+                "dos_jet":       _dos(parsed["jet"],        jet_demand),
+            }
+
+        return await get_cache().cache_or_fetch("eia:midstream_stocks_v1", fetch, ttl=3600)
+
+    async def get_crude_exports(self) -> dict[str, Any]:
+        """US crude oil exports — weekly MBD history + monthly PADD breakdown.
+
+        Weekly series: petroleum/sum/sndw, duoarea NUS-Z00, process EEX (MBBL/D).
+        Monthly PADD series: petroleum/move/expcp, one row per PADD of origin (MBBL/month).
+        """
+        _DAYS = 30.5
+
+        async def fetch() -> dict[str, Any]:
+            weekly_rows, padd_rows = await asyncio.gather(
+                self._fetch_eia_series(
+                    _ROUTE_WEEKLY_SUPPLY, CRUDE_EXPORTS_WEEKLY,
+                    frequency="weekly", length=260,
+                ),
+                self._fetch_eia_series(
+                    _ROUTE_CRUDE_EXPCP,
+                    {"product": ["EPC0"], "process": ["EEX"],
+                     "duoarea": CRUDE_EXPORTS_PADD_AREAS},
+                    frequency="monthly", length=300,
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(weekly_rows, Exception):
+                logger.warning("midstream.exports: weekly failed: %s", weekly_rows)
+                weekly_rows = []
+            if isinstance(padd_rows, Exception):
+                logger.warning("midstream.exports: padd monthly failed: %s", padd_rows)
+                padd_rows = []
+
+            weekly = self._parse_series(weekly_rows)
+            weekly_history = [
+                {"date": r["period"], "value": round(r["value"] / 1000, 3)}
+                for r in weekly
+            ]
+
+            # Monthly PADD: aggregate to US total per period + keep per-PADD latest
+            by_period_padd: dict[str, dict[str, float]] = {}
+            for row in padd_rows:
+                period = row.get("period", "")
+                area   = row.get("duoarea", "")      # e.g., "R30-Z00"
+                padd   = area.split("-")[0]           # → "R30"
+                label  = PADD_SHORT.get(padd, "")
+                if not period or not label:
+                    continue
+                try:
+                    val = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                by_period_padd.setdefault(period, {})[label] = val
+
+            sorted_periods_m = sorted(by_period_padd.keys(), reverse=True)
+            monthly_history = [
+                {
+                    "date":  f"{p}-01",
+                    "value": round(sum(by_period_padd[p].values()) / _DAYS / 1000, 3),
+                }
+                for p in sorted_periods_m[:36]
+            ]
+
+            latest_padd = by_period_padd.get(sorted_periods_m[0], {}) if sorted_periods_m else {}
+
+            return {
+                "latest_mbd":        round(weekly[0]["value"] / 1000, 3) if weekly else None,
+                "wow_mbd":           round(weekly[0].get("wow_change", 0) / 1000, 3) if weekly and weekly[0].get("wow_change") is not None else None,
+                "weekly_history":    weekly_history,
+                "latest_period_m":   sorted_periods_m[0] if sorted_periods_m else None,
+                "padd1_mbbl":        latest_padd.get("padd1"),
+                "padd2_mbbl":        latest_padd.get("padd2"),
+                "padd3_mbbl":        latest_padd.get("padd3"),
+                "padd4_mbbl":        latest_padd.get("padd4"),
+                "padd5_mbbl":        latest_padd.get("padd5"),
+                "monthly_history":   monthly_history,
+            }
+
+        return await get_cache().cache_or_fetch("eia:crude_exports_v1", fetch, ttl=3600)
+
+    async def get_midstream_imports(self) -> dict[str, Any]:
+        """Monthly US crude imports by country — top origins table + history + OPEC+ share.
+
+        Reuses the same crude-oil-imports route as the upstream tab but returns
+        only the monthly final feed enriched with an OPEC+ aggregate share.
+        """
+        async def fetch() -> dict[str, Any]:
+            rows = await self._fetch_eia_series(
+                _ROUTE_CRUDE_IMPORTS,
+                {"originType": ["CTY"], "destinationType": ["US"]},
+                frequency="monthly", length=2000,
+                data_columns=["quantity"],
+            )
+            feed = self._build_monthly_imports(rows)
+
+            # Compute OPEC+ share of latest month imports.
+            origins = feed.get("top_origins", [])
+            total   = feed.get("total_mbd")
+            opec_mbd = sum(o["volume_mbd"] for o in origins if o.get("is_opec_plus"))
+            opec_share = round(opec_mbd / total * 100, 1) if total else None
+
+            return {
+                "total_mbd":        total,
+                "top_origins":      origins,
+                "history":          feed.get("history", []),
+                "opec_plus_mbd":    round(opec_mbd, 3),
+                "opec_plus_share":  opec_share,
+            }
+
+        return await get_cache().cache_or_fetch("eia:midstream_imports_v1", fetch, ttl=21600)
+
+    async def get_padd_movements(self) -> dict[str, Any]:
+        """Monthly inter-PADD crude pipeline movements — all 13 directional pairs.
+
+        Route: petroleum/move/pipe, product EPC0, process LMV (movements by pipeline).
+        duoarea format: "DEST-SRC" — e.g., "R20-R30" = PADD 2 receives crude from PADD 3.
+        Units: MBBL/month (no per-day variant on this route).
+
+        Returns: per-pair history (newest-first) + latest-month net receipts per PADD
+        (positive = net importer, negative = net shipper).
+        """
+        async def fetch() -> dict[str, Any]:
+            rows = await self._fetch_eia_series(
+                _ROUTE_PADD_PIPE,
+                {
+                    "product":  ["EPC0"],
+                    "process":  ["LMV"],
+                    "duoarea":  PADD_PIPE_PAIRS,
+                },
+                frequency="monthly", length=800,
+            )
+
+            # Build {pair: {period: mbbl}}
+            by_pair_period: dict[str, dict[str, float]] = {}
+            for row in rows:
+                pair   = row.get("duoarea", "")
+                period = row.get("period",  "")
+                if not pair or not period or pair not in PADD_PIPE_PAIRS:
+                    continue
+                try:
+                    val = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                by_pair_period.setdefault(pair, {})[period] = val
+
+            # Build history lists (newest-first) per pair
+            flows: dict[str, list[dict[str, Any]]] = {}
+            for pair, by_period in by_pair_period.items():
+                flows[pair] = [
+                    {"period": f"{p}-01", "value": round(v, 1)}
+                    for p, v in sorted(by_period.items(), reverse=True)[:36]
+                ]
+
+            # Compute latest-month net receipts per PADD
+            all_periods = sorted(
+                {p for by_period in by_pair_period.values() for p in by_period},
+                reverse=True,
+            )
+            latest_p = all_periods[0] if all_periods else None
+            net: dict[str, float] = {label: 0.0 for label in PADD_SHORT.values()}
+            if latest_p:
+                for pair, by_period in by_pair_period.items():
+                    val = by_period.get(latest_p, 0.0)
+                    dest, src = pair[:3], pair[4:]
+                    dest_lbl = PADD_SHORT.get(dest)
+                    src_lbl  = PADD_SHORT.get(src)
+                    if dest_lbl:
+                        net[dest_lbl] = net.get(dest_lbl, 0.0) + val   # receipts +
+                    if src_lbl:
+                        net[src_lbl]  = net.get(src_lbl,  0.0) - val   # shipments −
+
+            # Human-readable labels for each pair
+            flow_labels = {
+                pair: f"{PADD_LABELS.get(pair[:3], pair[:3])} from {PADD_LABELS.get(pair[4:], pair[4:])}"
+                for pair in PADD_PIPE_PAIRS
+            }
+
+            return {
+                "latest_period": latest_p,
+                "flows":         flows,
+                "net_receipts":  {k: round(v, 1) for k, v in net.items()},
+                "flow_labels":   flow_labels,
+            }
+
+        return await get_cache().cache_or_fetch("eia:padd_movements_v1", fetch, ttl=86400)

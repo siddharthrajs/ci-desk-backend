@@ -44,6 +44,9 @@ class PolymarketService:
         active: bool | None = None,
         closed: bool | None = None,
         tag_id: int | None = None,
+        tag_slug: str | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "limit": limit,
@@ -51,8 +54,14 @@ class PolymarketService:
             "active": str(active).lower() if active is not None else None,
             "closed": str(closed).lower() if closed is not None else None,
             "tag_id": tag_id,
+            "tag_slug": tag_slug,
+            "order": order,
+            "ascending": str(ascending).lower() if ascending is not None else None,
         }
-        cache_key = f"polymarket:markets:{limit}:{offset}:{active}:{closed}:{tag_id}"
+        cache_key = (
+            f"polymarket:markets:{limit}:{offset}:{active}:{closed}:"
+            f"{tag_id}:{tag_slug}:{order}:{ascending}"
+        )
 
         async def fetch() -> list[dict[str, Any]]:
             return await self._get("/markets", params)
@@ -110,6 +119,9 @@ class PolymarketService:
         active: bool | None = None,
         closed: bool | None = None,
         tag_id: int | None = None,
+        tag_slug: str | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "limit": limit,
@@ -117,8 +129,14 @@ class PolymarketService:
             "active": str(active).lower() if active is not None else None,
             "closed": str(closed).lower() if closed is not None else None,
             "tag_id": tag_id,
+            "tag_slug": tag_slug,
+            "order": order,
+            "ascending": str(ascending).lower() if ascending is not None else None,
         }
-        cache_key = f"polymarket:events:{limit}:{offset}:{active}:{closed}:{tag_id}"
+        cache_key = (
+            f"polymarket:events:{limit}:{offset}:{active}:{closed}:"
+            f"{tag_id}:{tag_slug}:{order}:{ascending}"
+        )
 
         async def fetch() -> list[dict[str, Any]]:
             return await self._get("/events", params)

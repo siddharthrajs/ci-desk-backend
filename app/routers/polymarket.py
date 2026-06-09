@@ -34,8 +34,11 @@ async def list_markets(
     offset: int = Query(0, ge=0, description="Pagination offset"),
     active: bool | None = Query(None, description="Filter by active status"),
     closed: bool | None = Query(None, description="Filter by closed status"),
-    tag_id: int | None = Query(None, description="Filter by tag ID e.g. 1396=international-affairs, 933=federal-government"),
-    q: str | None = Query(None, description="Keyword filter on market question e.g. iran, russia, trump"),
+    tag_id: int | None = Query(None, description="Filter by tag ID e.g. 1396=international-affairs"),
+    tag_slug: str | None = Query(None, description="Filter by tag slug e.g. geopolitics"),
+    order: str | None = Query(None, description="Sort field e.g. volume, liquidity, startDate"),
+    ascending: bool | None = Query(None, description="Sort direction; false = descending"),
+    q: str | None = Query(None, description="Keyword filter on market question e.g. iran, russia"),
     svc: PolymarketService = Depends(get_polymarket_service),
 ) -> MarketsResponse:
     if q:
@@ -46,7 +49,16 @@ async def list_markets(
     else:
         raw = await call_upstream(
             "Polymarket",
-            lambda: svc.get_markets(limit=limit, offset=offset, active=active, closed=closed, tag_id=tag_id),
+            lambda: svc.get_markets(
+                limit=limit,
+                offset=offset,
+                active=active,
+                closed=closed,
+                tag_id=tag_id,
+                tag_slug=tag_slug,
+                order=order,
+                ascending=ascending,
+            ),
         )
     markets = [PolymarketMarket.model_validate(m) for m in raw]
     return MarketsResponse(markets=markets, count=len(markets))
@@ -77,12 +89,24 @@ async def list_events(
     offset: int = Query(0, ge=0, description="Pagination offset"),
     active: bool | None = Query(None, description="Filter by active status"),
     closed: bool | None = Query(None, description="Filter by closed status"),
-    tag_id: int | None = Query(None, description="Filter by tag ID e.g. 1396=international-affairs, 933=federal-government"),
+    tag_id: int | None = Query(None, description="Filter by tag ID e.g. 1396=international-affairs"),
+    tag_slug: str | None = Query(None, description="Filter by tag slug e.g. geopolitics"),
+    order: str | None = Query(None, description="Sort field e.g. volume, liquidity, startDate"),
+    ascending: bool | None = Query(None, description="Sort direction; false = descending"),
     svc: PolymarketService = Depends(get_polymarket_service),
 ) -> EventsResponse:
     raw = await call_upstream(
         "Polymarket",
-        lambda: svc.get_events(limit=limit, offset=offset, active=active, closed=closed, tag_id=tag_id),
+        lambda: svc.get_events(
+            limit=limit,
+            offset=offset,
+            active=active,
+            closed=closed,
+            tag_id=tag_id,
+            tag_slug=tag_slug,
+            order=order,
+            ascending=ascending,
+        ),
     )
     events = [PolymarketEvent.model_validate(e) for e in raw]
     return EventsResponse(events=events, count=len(events))
@@ -100,3 +124,30 @@ async def get_event(
 ) -> EventResponse:
     raw = await call_upstream("Polymarket", lambda: svc.get_event(event_id))
     return EventResponse(event=PolymarketEvent.model_validate(raw))
+
+
+@router.get(
+    "/geopolitics",
+    response_model=EventsResponse,
+    summary="Geopolitics prediction markets sorted by volume (mirrors polymarket.com/geopolitics)",
+    responses={502: {"description": "Upstream Polymarket fetch failed"}},
+)
+async def list_geopolitics_events(
+    limit: int = Query(20, ge=1, le=100, description="Number of events to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    svc: PolymarketService = Depends(get_polymarket_service),
+) -> EventsResponse:
+    raw = await call_upstream(
+        "Polymarket",
+        lambda: svc.get_events(
+            limit=limit,
+            offset=offset,
+            tag_slug="geopolitics",
+            active=True,
+            closed=False,
+            order="volume",
+            ascending=False,
+        ),
+    )
+    events = [PolymarketEvent.model_validate(e) for e in raw]
+    return EventsResponse(events=events, count=len(events))

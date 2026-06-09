@@ -24,6 +24,7 @@ HANIYEH                 = Tag(733,  "haniyeh",                "haniyeh")
 MARITIME_TRANSPORT      = Tag(777,  "maritime transport",     "maritime-transport")
 INTELLIGENCE            = Tag(411,  "intelligence",           "intelligence")
 KOREA                   = Tag(103269, "Korea",                "korea")
+GEOPOLITICS             = Tag(100265, "Geopolitics",          "geopolitics")
 
 # ---------------------------------------------------------------------------
 # US Government & Policy
@@ -128,6 +129,7 @@ CYBERTRUCK              = Tag(101604, "Cybertruck",           "cybertruck")
 # Curated sets for CI-DESK dashboard filtering
 # ---------------------------------------------------------------------------
 GEOPOLITICAL_TAGS: list[Tag] = [
+    GEOPOLITICS,
     INTERNATIONAL_AFFAIRS,
     FOREIGN_AFFAIRS,
     MILITARY_INVASION,
