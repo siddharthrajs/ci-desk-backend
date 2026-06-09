@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Secrets — never bake these into the image
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# Tests (not needed at runtime)
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+pytest.ini
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+
+# Misc
+*.log
+lightstreamer/
+README.md
