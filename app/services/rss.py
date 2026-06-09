@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,7 +30,7 @@ _RSS_HEADERS = {
     "Pragma": "no-cache",
 }
 
-FEEDS: list[dict[str, str]] = [
+_ALL_FEEDS: list[dict[str, str]] = [
     {"source": "OilPrice",                 "url": "https://oilprice.com/rss/main"},
     {"source": "EIA Today in Energy",      "url": "https://www.eia.gov/rss/todayinenergy.xml"},
     {"source": "S&P Global Oil",           "url": "https://www.spglobal.com/content/spglobal/energy/us/en/rss/oil.xml"},
@@ -43,6 +44,11 @@ FEEDS: list[dict[str, str]] = [
     {"source": "OGJ Drilling",             "url": "https://www.ogj.com/__rss/website-scheduled-content.xml?input=%7B%22sectionAlias%22%3A%22drilling-production%22%7D"},
     {"source": "OGJ Refining",             "url": "https://www.ogj.com/__rss/website-scheduled-content.xml?input=%7B%22sectionAlias%22%3A%22refining-processing%22%7D"},
 ]
+
+_SP_SOURCES = {"S&P Global Oil", "S&P Global Crude", "S&P Global Refined Prods"}
+FEEDS = [f for f in _ALL_FEEDS if f["source"] not in _SP_SOURCES] \
+    if os.getenv("DISABLE_SP_GLOBAL_FEEDS", "").lower() == "true" \
+    else _ALL_FEEDS
 
 
 class RssService:
