@@ -19,6 +19,7 @@ from app.services.eia import EIAService
 from app.services.financial_juice import FinancialJuiceService
 from app.services.finnhub import FinnhubService
 from app.services.fred import FREDService
+from app.services.polymarket import PolymarketService
 from app.services.wpsr import WPSRService
 
 
@@ -54,3 +55,7 @@ def get_financial_juice_service() -> FinancialJuiceService:
 
 def get_ai_summary_service() -> AiSummaryService:
     return AiSummaryService(settings.gemini_api_key, settings.openai_api_key)
+
+
+def get_polymarket_service() -> PolymarketService:
+    return PolymarketService(get_http_client())
