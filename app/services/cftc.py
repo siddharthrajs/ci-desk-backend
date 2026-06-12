@@ -370,7 +370,6 @@ class CFTCService:
         async def fetch() -> dict[str, Any]:
             records   = await self._fetch_records()
             contracts = parse_petroleum_cot(records)
-            # Use WTI Physical report date as the canonical date; fall back to first contract
             report_date = next(
                 (c["report_date"] for c in contracts if c["contract_market_code"] == "067651"),
                 contracts[0]["report_date"] if contracts else "",
@@ -378,3 +377,60 @@ class CFTCService:
             return {"contracts": contracts, "report_date": report_date}
 
         return await get_cache().cache_or_fetch(COT_CACHE_KEY, fetch, ttl=_COT_TTL_SECONDS)
+
+    async def get_contract_history(self, contract_code: str) -> dict[str, Any]:
+        """Return the 3-year weekly time series for a single contract, cached 6 h."""
+        _HISTORY_SELECT = ",".join([
+            _COL_DATE,
+            "cftc_contract_market_code",
+            "contract_market_name",
+            "market_and_exchange_names",
+            "m_money_positions_long_all",
+            "m_money_positions_short_all",
+            "m_money_positions_spread",
+            "open_interest_all",
+        ])
+
+        async def fetch() -> dict[str, Any]:
+            params = {
+                "$where":  f"cftc_contract_market_code='{contract_code}' AND futonly_or_combined='FutOnly'",
+                "$order":  f"{_COL_DATE} DESC",
+                "$limit":  str(_LOOKBACK_WEEKS),
+                "$select": _HISTORY_SELECT,
+            }
+            response = await self._client.get(_RESOURCE_URL, params=params)
+            response.raise_for_status()
+            rows = response.json()
+
+            if not rows:
+                raise ValueError(f"No COT history for contract_code={contract_code!r}")
+
+            # Parse identity from the first (most recent) row
+            first = rows[0]
+            market_and_exchange = first.get("market_and_exchange_names", "")
+            parts = market_and_exchange.rsplit(" - ", 1)
+            exchange = parts[1] if len(parts) == 2 else market_and_exchange
+
+            # Build ascending history (oldest first — required by lightweight-charts)
+            history = []
+            for row in reversed(rows):
+                mm_long  = _i(row, "m_money_positions_long_all")
+                mm_short = _i(row, "m_money_positions_short_all")
+                history.append({
+                    "date":           str(row.get(_COL_DATE, ""))[:10],
+                    "mm_long":        mm_long,
+                    "mm_short":       mm_short,
+                    "mm_net":         mm_long - mm_short,
+                    "mm_spread":      _i(row, "m_money_positions_spread"),
+                    "open_interest":  _i(row, "open_interest_all"),
+                })
+
+            return {
+                "contract_market_code": contract_code,
+                "contract_market_name": first.get("contract_market_name", ""),
+                "exchange":             exchange,
+                "history":              history,
+            }
+
+        key = f"cftc:history:{contract_code}"
+        return await get_cache().cache_or_fetch(key, fetch, ttl=_COT_TTL_SECONDS)

@@ -172,3 +172,26 @@ class COTResponse(BaseModel):
     last_updated: datetime = Field(
         default_factory=utc_now, description="UTC timestamp when this response was assembled"
     )
+
+
+# =============================================================================
+# COT History — per-contract time series for the Positions tab
+# =============================================================================
+
+
+class COTHistoryPoint(BaseModel):
+    date: str
+    mm_long: int
+    mm_short: int
+    mm_net: int
+    mm_spread: int
+    open_interest: int
+
+
+class COTHistoryResponse(BaseModel):
+    contract_market_code: str
+    contract_market_name: str
+    exchange: str
+    history: list[COTHistoryPoint] = Field(
+        ..., description="Weekly series, oldest first, covering up to 3 years"
+    )

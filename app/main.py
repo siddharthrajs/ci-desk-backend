@@ -10,7 +10,7 @@ from app.core import cache as cache_module
 from app.core.cache import RedisCache
 from app.core.http_client import close_http_client, init_http_client
 from app.core.logging import configure_logging
-from app.routers import downstream, health, macro, markets, midstream, news, polymarket, reports, upstream
+from app.routers import downstream, health, macro, markets, midstream, news, polymarket, positions, reports, upstream
 from app.scheduler.setup import register_jobs, scheduler
 import app.services.lightstreamer_broadcaster as ls_module
 from app.services.lightstreamer_broadcaster import LightstreamerBroadcaster
@@ -74,6 +74,7 @@ app.include_router(upstream.router, prefix="/api")
 app.include_router(midstream.router, prefix="/api")
 app.include_router(downstream.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(positions.router, prefix="/api")
 app.include_router(macro.router, prefix="/api")
 app.include_router(markets.router, prefix="/api")
 app.include_router(news.router, prefix="/api")
