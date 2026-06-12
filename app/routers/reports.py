@@ -1,4 +1,4 @@
-"""Reports tab — EIA WPSR tables and CFTC COT managed money positions."""
+"""Reports tab — EIA WPSR tables and CFTC COT petroleum positions."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from app.core.cache import get_cache
 from app.core.deps import get_cftc_service, get_wpsr_service
 from app.core.upstream import call_upstream
 from app.models.reports import (
+    COTContract,
     COTResponse,
-    ManagedMoneyPosition,
     WPSRResponse,
     WPSRTable,
 )
-from app.services.cftc import BRENT_CODE, WTI_CODE, CFTCService
+from app.services.cftc import COT_CACHE_KEY, CFTCService
 from app.services.wpsr import TABLE_NUMBERS, WPSRService
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -29,7 +29,6 @@ def _wpsr_table_key(n: int) -> str:
 
 
 async def _bust_wpsr_cache() -> None:
-    """Delete all WPSR cache keys so the next fetch hits EIA directly."""
     cache = get_cache()
     await cache.delete(_WPSR_ALL_KEY)
     for n in TABLE_NUMBERS:
@@ -90,20 +89,21 @@ async def get_wpsr_single_table(
 @router.get(
     "/cot",
     response_model=COTResponse,
-    summary="CFTC Commitments of Traders — WTI and Brent managed money positions",
+    summary="CFTC Commitments of Traders — all petroleum contracts (disaggregated futures-only)",
     responses={502: {"description": "Upstream CFTC fetch failed"}},
 )
 async def get_cot(
+    refresh: bool = Query(
+        False,
+        description="If true, bypass the 6-hour cache and re-fetch from CFTC.",
+    ),
     cftc: CFTCService = Depends(get_cftc_service),
 ) -> COTResponse:
-    async def fetch_both() -> tuple[dict, dict]:
-        return await asyncio.gather(
-            cftc.get_managed_money_positions(WTI_CODE),
-            cftc.get_managed_money_positions(BRENT_CODE),
-        )
+    if refresh:
+        await get_cache().delete(COT_CACHE_KEY)
 
-    wti, brent = await call_upstream("CFTC", fetch_both)
+    payload = await call_upstream("CFTC", cftc.get_petroleum_cot)
     return COTResponse(
-        wti=ManagedMoneyPosition(**wti),
-        brent=ManagedMoneyPosition(**brent),
+        contracts=[COTContract(**c) for c in payload["contracts"]],
+        report_date=payload["report_date"],
     )

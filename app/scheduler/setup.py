@@ -13,6 +13,9 @@ scheduler = AsyncIOScheduler(timezone=settings.scheduler_timezone)
 
 def register_jobs() -> None:
     """Register all background refresh jobs."""
+    # DISABLED: all scheduled jobs are temporarily disabled
+    return
+
     if settings.finnhub_api_key:
         from app.scheduler.jobs import (
             refresh_finnhub_company_news,

@@ -26,22 +26,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_http_client()
     cache_module.cache = RedisCache(settings.redis_url)
 
-    register_jobs()
-    scheduler.start()
-    logger.info("Scheduler started")
+    # DISABLED: scheduler and warmup tasks are temporarily disabled
+    # register_jobs()
+    # scheduler.start()
+    # logger.info("Scheduler started")
 
-    import asyncio as _asyncio
-    from app.scheduler.jobs import warmup_morning_brief
-    _asyncio.create_task(warmup_morning_brief())
-    logger.info("Morning brief warmup task created")
+    # import asyncio as _asyncio
+    # from app.scheduler.jobs import warmup_macro_data, warmup_morning_brief
+    # _asyncio.create_task(warmup_morning_brief())
+    # _asyncio.create_task(warmup_macro_data())
+    # logger.info("Morning brief and macro data warmup tasks created")
 
     ls_module.broadcaster = LightstreamerBroadcaster()
     ls_module.broadcaster.start()
 
     yield
 
-    scheduler.shutdown(wait=False)
-    logger.info("Scheduler stopped")
+    # DISABLED: scheduler.shutdown(wait=False)
+    # logger.info("Scheduler stopped")
 
     if ls_module.broadcaster is not None:
         ls_module.broadcaster.stop()
